@@ -14,7 +14,7 @@
 
 @ CG2028 Assignment
 @ (c) ECE NUS
-@ Write Student 1's Name here: ABCD (A1234567R)
+@ Write Student 1's Name here: Alexander Yaw Kai Mun (A0306763B)
 @ Write Student 2's Name here: WXYZ (A0000007X)
 @
 @ Function prototype:
@@ -44,7 +44,14 @@
 ewma_filter:
     PUSH {r4-r7, lr}
 
-    @ TODO: Implement the EWMA low-pass filter in pure ARM assembly.
+    MUL r0, r0, r2  @ alpha_percent x new_data
+
+    RSB r3, r2, #100  @ 100 - alpha_percent
+
+    MLA r0, r3, r1, r0  @ (alpha_current x new_data) + (100 - alpha_percent) x old_output
+
+    MOV r3, #100
+    SDIV r0, r0, r3
 
     POP  {r4-r7, pc}
 
