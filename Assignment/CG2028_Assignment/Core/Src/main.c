@@ -21,6 +21,23 @@
 #define NORMAL_LED_DELAY_MS       1000
 #define FALL_LED_DELAY_MS          150
 
+/*--------------------------- Sampling ----------------------------------*/
+#define SAMPLE_PERIOD_MS           20  // 50Hz
+#define STARTUP_WARMUP_MS          500
+#define IMPACT_WINDOW_MS          1000
+#define POST_IMPACT_WINDOW_MS     2000
+#define INACTIVITY_REQUIRED_MS     750
+#define UART_REPORT_PERIOD_MS      200
+
+/*--------------------------- Thresholds ----------------------------------*/
+#define FREE_FALL_MG               650
+#define IMPACT_MG                 1800
+#define SUDDEN_CHANGE_MG           600
+#define RAPID_ROTATION_MDPS      150000
+#define STATIONARY_ROTATION_MDPS  20000
+#define STATIONARY_ACCEL_MIN_MG    850
+#define STATIONARY_ACCEL_MAX_MG   1150
+
 static void UART1_Init(void);
 static void UART_Send(const char *text);
 
