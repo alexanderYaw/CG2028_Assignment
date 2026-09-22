@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 
 /*--------------------------- Configuration ----------------------------------*/
 #define EWMA_ALPHA_ACCEL_PERCENT   25
@@ -38,6 +39,31 @@
 #define STATIONARY_ACCEL_MIN_MG    850
 #define STATIONARY_ACCEL_MAX_MG   1150
 
+typedef enum {
+	FALL_PHASE_MONITORING,
+	FALL_PHASE_AWAIT_IMPACT,
+	FALL_PHASE_POST_IMPACT,
+	FALL_PHASE_ALARM
+} FallPhase;
+
+typedef struct {
+	FallPhase phase;
+	uint32_t startup_timer_ms;
+	uint32_t phase_start_ms;
+	uint32_t inactivity_start_ms;
+
+	bool is_inactive;
+	bool is_free_fall;
+	bool is_rapid_rotation;
+
+	int prev_accel[3];
+	uint64_t prev_accel_squared;
+	bool has_prev_accel;
+
+	int pre_fall_accel[3];
+	bool has_pre_fall_accel;
+} FallDetector;
+
 static void UART1_Init(void);
 static void UART_Send(const char *text);
 
@@ -45,6 +71,18 @@ extern int ewma_filter(int new_data, int old_output, int alpha_percent);
 //int ewma_filter_C(int new_data, int old_output, int alpha_percent);
 
 UART_HandleTypeDef huart1;
+
+static uint64_t square (uint32_t input) {
+	return (uint64_t)(input * input);
+}
+
+static uint64_t vector_squared(int vector[3]) {
+	int64_t x = vector[0];
+	int64_t y = vector[1];
+	int64_t z = vector[2];
+
+	return (uint64_t)((x * x) + (y * y) + (z * z));
+}
 
 int main(void)
 {
