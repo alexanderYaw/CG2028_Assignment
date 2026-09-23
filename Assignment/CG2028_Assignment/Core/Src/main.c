@@ -39,6 +39,7 @@
 #define STATIONARY_ACCEL_MIN_MG    850
 #define STATIONARY_ACCEL_MAX_MG   1150
 
+/*--------------------------- Falling Phases and Phase detector ----------------------------------*/
 typedef enum {
 	FALL_PHASE_MONITORING,
 	FALL_PHASE_AWAIT_IMPACT,
@@ -57,7 +58,6 @@ typedef struct {
 	bool is_rapid_rotation;
 
 	int prev_accel[3];
-	uint64_t prev_accel_squared;
 	bool has_prev_accel;
 
 	int pre_fall_accel[3];
@@ -72,16 +72,33 @@ extern int ewma_filter(int new_data, int old_output, int alpha_percent);
 
 UART_HandleTypeDef huart1;
 
-static uint64_t square (uint32_t input) {
+static uint64_t square (int64_t input) {
 	return (uint64_t)(input * input);
 }
 
-static uint64_t vector_squared(int vector[3]) {
+static uint64_t square_vector_magnitude(int vector[3]) {
 	int64_t x = vector[0];
 	int64_t y = vector[1];
 	int64_t z = vector[2];
 
 	return (uint64_t)((x * x) + (y * y) + (z * z));
+}
+
+static bool is_vector_change_exceeded(const int curr_vector[3], const int prev_vector[3], uint32_t threshold) {
+	uint64_t delta = 0;
+	uint64_t threshold_sqrd;
+
+	for (int i = 0; i < 3; i++) {
+		delta += square((int64_t)curr_vector[i] - prev_vector[i]);
+	}
+
+	threshold_sqrd = square(threshold);
+
+	if (delta <= threshold_sqrd) {
+		return 0;
+	}
+
+	return 1;
 }
 
 int main(void)
@@ -103,6 +120,11 @@ int main(void)
     int gyro_ewma_c[3]  = {0, 0, 0};
 
     unsigned long sample_number = 0;
+
+    /* Initialise the fall detector */
+    FallDetector detector = {0};
+    detector.phase = FALL_PHASE_MONITORING;
+    detector.startup_timer_ms = HAL_GetTick();
 
     while (1)
     {
@@ -140,6 +162,15 @@ int main(void)
                 gyro_ewma_c[axis],
                 EWMA_ALPHA_GYRO_PERCENT);
         }
+
+        uint64_t accel_mag_sqrd = square_vector_magnitude(accel_ewma_asm);
+        uint64_t gyro_mag_sqrd = square_vector_magnitude(gyro_ewma_asm);
+
+        bool possible_free_fall = (accel_mag_sqrd < square(FREE_FALL_MG));
+        bool impact_detected = (accel_mag_sqrd > square(IMPACT_MG));
+        bool rapid_rotation = (gyro_mag_sqrd > square(RAPID_ROTATION_MDPS));
+        bool is_stationary = (accel_mag_sqrd > square(STATIONARY_ACCEL_MIN_MG)) &&
+        			(accel_mag_sqrd < square(STATIONARY_ACCEL_MAX_MG));
 
         /* Accelerometer filtered readings are in meters per second squared. */
         float accel_mps2[3] = {
