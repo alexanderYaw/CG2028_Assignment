@@ -146,12 +146,21 @@ static int recent_min_accel(const FallDetector *detector)
 	return lowest;
 }
 
+static uint32_t current_osc_ms(const FallDetector *detector, uint32_t now_ms)
+{
+	if ((now_ms - detector->last_reversal_ms) > OSCILLATION_GAP_MS) {
+		return 0U;
+	}
+	return detector->last_reversal_ms - detector->osc_chain_start_ms;
+}
+
 static void start_suspected_fall(FallDetector *detector, uint32_t now_ms)
 {
 	detector->free_fall_samples = 0;
 	detector->peak_accel_mg = detector->accel_mag_mg;
 	detector->peak_gyro_mdps = recent_peak_gyro(detector);
 	detector->min_accel_mg = recent_min_accel(detector);
+	detector->max_osc_ms = current_osc_ms(detector, now_ms);
 	detector->post_sum[0] = detector->post_sum[1] = detector->post_sum[2] = 0;
 	detector->post_samples = 0;
 	detector->is_inactive = false;
@@ -201,7 +210,8 @@ static FallEvent evaluate_suspected_fall(FallDetector *detector, uint32_t now_ms
 	detector->last_inactive_pct = detector->is_inactive ? 100 : 0;
 
 	bool rotation_ok = (detector->peak_gyro_mdps >= RAPID_ROTATION_MDPS);
-	bool posture_ok = (detector->last_posture_deg >= POSTURE_CHANGE_DEG);
+	bool oscillated = (detector->max_osc_ms >= OSCILLATION_MAX_MS);
+	bool posture_ok = (detector->last_posture_deg >= POSTURE_CHANGE_DEG) && !oscillated;
 	bool dropped = (detector->min_accel_mg < DEEP_FREE_FALL_MG);
 	bool inactivity_ok = detector->is_inactive;
 
@@ -218,7 +228,7 @@ static FallEvent evaluate_suspected_fall(FallDetector *detector, uint32_t now_ms
 		append_reason(detector->last_reason, "rotation too slow");
 	}
 	if (!posture_ok && !dropped) {
-		append_reason(detector->last_reason, "no posture change or drop");
+		append_reason(detector->last_reason, oscillated ? "shaken, no drop" : "no posture change or drop");
 	}
 	if (!inactivity_ok) {
 		append_reason(detector->last_reason, "still moving after impact");
@@ -229,7 +239,7 @@ static FallEvent evaluate_suspected_fall(FallDetector *detector, uint32_t now_ms
 
 /* Per-sample features and flags, in the units of the thresholds. */
 static void update_features(FallDetector *detector, const int accel_mg[3],
-                            const int gyro_mdps[3])
+                            const int gyro_mdps[3], uint32_t now_ms)
 {
 	uint64_t accel_mag_sqrd = square_vector_magnitude(accel_mg);
 	uint64_t gyro_mag_sqrd = square_vector_magnitude(gyro_mdps);
@@ -260,6 +270,28 @@ static void update_features(FallDetector *detector, const int accel_mg[3],
 	if (detector->accel_mag_mg < detector->min_accel_mg) {
 		detector->min_accel_mg = detector->accel_mag_mg;
 	}
+
+	for (int i = 0; i < 3; i++) {
+		int sign = (gyro_mdps[i] > OSCILLATION_MDPS) ? 1 : (gyro_mdps[i] < -OSCILLATION_MDPS) ? -1 : 0;
+
+		if (sign == 0) {
+			continue;
+		}
+		if (detector->last_gyro_sign[i] == -sign &&
+		    (now_ms - detector->last_gyro_sign_ms[i]) <= OSCILLATION_GAP_MS) {
+			if ((now_ms - detector->last_reversal_ms) > OSCILLATION_GAP_MS) {
+				detector->osc_chain_start_ms = now_ms;
+			}
+			detector->last_reversal_ms = now_ms;
+		}
+		detector->last_gyro_sign[i] = sign;
+		detector->last_gyro_sign_ms[i] = now_ms;
+	}
+
+	uint32_t osc_ms = current_osc_ms(detector, now_ms);
+	if (osc_ms > detector->max_osc_ms) {
+		detector->max_osc_ms = osc_ms;
+	}
 }
 
 /*------------------------------- API ----------------------------------------*/
@@ -271,6 +303,7 @@ void FallDetector_Init(FallDetector *detector, uint32_t now_ms)
 	detector->startup_timer_ms = now_ms;
 	detector->phase_start_ms = now_ms;
 	detector->reference_still_start_ms = now_ms;
+	detector->last_reversal_ms = now_ms - OSCILLATION_GAP_MS - 1U;
 
 	for (uint32_t i = 0; i < GYRO_HISTORY_LEN; i++) {
 		detector->accel_history[i] = 1000;
@@ -280,7 +313,7 @@ void FallDetector_Init(FallDetector *detector, uint32_t now_ms)
 FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
                               const int gyro_mdps[3], uint32_t now_ms)
 {
-	update_features(detector, accel_mg, gyro_mdps);
+	update_features(detector, accel_mg, gyro_mdps, now_ms);
 
 	bool warmed_up = (now_ms - detector->startup_timer_ms) >= STARTUP_WARMUP_MS;
 	uint32_t in_phase_ms = now_ms - detector->phase_start_ms;

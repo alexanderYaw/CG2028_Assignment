@@ -35,6 +35,9 @@
 #define IMPACT_MG                 1800  /* hard landing, no free fall needed  */
 #define SOFT_IMPACT_MG            1300  /* enough after a confirmed free fall */
 #define DEEP_FREE_FALL_MG          300  /* drops 18-237 mg, activities >= 434 */
+#define OSCILLATION_MDPS        100000
+#define OSCILLATION_GAP_MS         500
+#define OSCILLATION_MAX_MS        1000
 #define LANDING_MG                 950  /* back to ~1 g after a deep free fall */
 #define SUDDEN_CHANGE_MG           600  /* jerk trigger for falls w/o free fall*/
 #define RAPID_ROTATION_MDPS     150000  /* 150 dps; sitting/bending < ~100    */
@@ -117,6 +120,11 @@ typedef struct {
 	uint32_t free_fall_samples;
 	int peak_accel_mg;
 	int min_accel_mg;
+	int last_gyro_sign[3];
+	uint32_t last_gyro_sign_ms[3];
+	uint32_t last_reversal_ms;
+	uint32_t osc_chain_start_ms;
+	uint32_t max_osc_ms;
 	int peak_gyro_mdps;
 	int32_t post_sum[3];
 	uint32_t post_samples;
