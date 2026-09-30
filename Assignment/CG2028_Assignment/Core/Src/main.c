@@ -31,6 +31,7 @@
 /*--------------------------- Includes ---------------------------------------*/
 #include "main.h"
 #include "fall_detector.h"
+#include "data_logger.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 
@@ -124,9 +125,19 @@ int main(void)
     FallDetector detector;
     FallDetector_Init(&detector, HAL_GetTick());
 
-    UART_Send("\r\n=== ElderCare Wearable Safety Companion ===\r\n"
-              "Hold the board still and upright to set the reference posture.\r\n"
-              "Button: short press = I am OK, hold 2 s = SOS.\r\n");
+    if (DATA_LOG_MODE)
+    {
+        char header[256];
+        DataLogger_FormatHeader(header, sizeof(header), EWMA_ALPHA_ACCEL_PERCENT,
+                                EWMA_ALPHA_GYRO_PERCENT, SAMPLE_PERIOD_MS);
+        UART_Send(header);
+    }
+    else
+    {
+        UART_Send("\r\n=== ElderCare Wearable Safety Companion ===\r\n"
+                  "Hold the board still and upright to set the reference posture.\r\n"
+                  "Button: short press = I am OK, hold 2 s = SOS.\r\n");
+    }
 
     uint32_t next_sample_ms = HAL_GetTick();
     uint32_t last_report_ms = 0;
@@ -155,6 +166,7 @@ int main(void)
         BSP_GYRO_GetXYZ(gyro_raw_float);         /* mdps */
 
         /*---------------- EWMA filtering (assembly) ----------------*/
+        bool asm_matches_c = true;
         for (int axis = 0; axis < 3; axis++)
         {
             gyro_raw_int[axis] = (int)gyro_raw_float[axis];
@@ -183,6 +195,7 @@ int main(void)
                 (gyro_ewma_asm[axis] != gyro_ewma_c[axis]))
             {
                 asm_mismatch = true;
+                asm_matches_c = false;
             }
         }
 
@@ -196,18 +209,41 @@ int main(void)
         }
 
         ButtonEvent button = Button_Poll(now_ms);
+        FallEvent button_event = FALL_EVENT_NONE;
         if (button == BUTTON_EVENT_SHORT)
         {
-            Report_Event(FallDetector_Acknowledge(&detector, now_ms), &detector, now_ms);
+            button_event = FallDetector_Acknowledge(&detector, now_ms);
         }
         else if (button == BUTTON_EVENT_LONG)
         {
-            Report_Event(FallDetector_RequestSOS(&detector, now_ms), &detector, now_ms);
+            button_event = FallDetector_RequestSOS(&detector, now_ms);
         }
+        Report_Event(button_event, &detector, now_ms);
 
         /*---------------- Outputs ----------------*/
         LED_Update(detector.phase, now_ms);
         Buzzer_Update(detector.phase, now_ms);
+
+        if (DATA_LOG_MODE)
+        {
+            DataLogSample sample = {
+                .t_ms = now_ms,
+                .phase = detector.phase,
+                .event = (button_event != FALL_EVENT_NONE) ? button_event : event,
+                .asm_matches_c = asm_matches_c,
+            };
+            for (int axis = 0; axis < 3; axis++)
+            {
+                sample.accel_raw_mg[axis]   = accel_raw_i16[axis];
+                sample.gyro_raw_mdps[axis]  = gyro_raw_int[axis];
+                sample.accel_filt_mg[axis]  = accel_ewma_asm[axis];
+                sample.gyro_filt_mdps[axis] = gyro_ewma_asm[axis];
+            }
+            char line[160];
+            DataLogger_FormatSample(line, sizeof(line), &sample);
+            UART_Send(line);
+            continue;   /* text reports would corrupt the CSV */
+        }
 
         bool evaluating = (detector.phase == FALL_PHASE_AWAIT_IMPACT) ||
                           (detector.phase == FALL_PHASE_POST_IMPACT);
@@ -454,6 +490,10 @@ static ButtonEvent Button_Poll(uint32_t now_ms)
 
 static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms)
 {
+    if (DATA_LOG_MODE)
+    {
+        return;   /* events are logged as a CSV column instead */
+    }
     char buffer[200];
     buffer[0] = '\0';
 
