@@ -4,21 +4,6 @@
  *
  * Phase machine (all inputs are EWMA-filtered by the assembly routine):
  *
- *   MONITORING --free fall / sudden change--> AWAIT_IMPACT --impact--> POST_IMPACT
- *        ^                                         |                      |
- *        |                                    no impact                 checks
- *        +----------- near fall (reason reported) --+----------------------+
- *        |                                                          all pass |
- *        +--- acknowledged / recovered --- ALARM <---------------------------+
- *                                           | no response for LONG_LIE_MS
- *                                           v
- *                                        LONG_LIE        SOS (button, any time)
- *
- * Confirmation needs all three, each from a different physical quantity:
- *   1. rapid rotation   peak |w| >= RAPID_ROTATION_MDPS   (gyroscope)
- *   2. posture change   >= POSTURE_CHANGE_DEG vs the last stationary posture
- *   3. inactivity       stationary for >= INACTIVITY_REQUIRED_MS, and for
- *                       >= INACTIVITY_RATIO_PCT of the observation window
  *
  * Magnitude comparisons are done on squared values so that no square root is
  * needed. The reported tilt angle uses a polynomial arccos approximation, so
@@ -34,10 +19,11 @@
 /*--------------------------- Sampling ---------------------------------------*/
 #define SAMPLE_PERIOD_MS           20   /* 50 Hz; sensor ODR is 52 Hz         */
 #define STARTUP_WARMUP_MS         500   /* EWMA outputs start at 0; ignore    */
-#define IMPACT_WINDOW_MS         1000   /* a fall reaches the floor within 1 s */
-#define POST_IMPACT_WINDOW_MS    2000   /* observation window after impact    */
+#define IMPACT_WINDOW_MS         1000   /* a fall reaches the floor within 1 s*/
+#define POST_IMPACT_WINDOW_MS    10000  /* observation window after impact    */
 #define POST_IMPACT_SETTLE_MS     500   /* bounces/rotation may continue      */
 #define INACTIVITY_REQUIRED_MS    750   /* continuous stillness needed        */
+#define REFERENCE_HOLD_MS         100   /* 5 samples: ignore one-off pauses   */
 #define UART_REPORT_PERIOD_MS     200
 
 /*--------------------------- Thresholds -------------------------------------
@@ -48,6 +34,8 @@
 #define FREE_FALL_MIN_SAMPLES        3  /* 60 ms, rejects single noisy sample */
 #define IMPACT_MG                 1800  /* hard landing, no free fall needed  */
 #define SOFT_IMPACT_MG            1300  /* enough after a confirmed free fall */
+#define DEEP_FREE_FALL_MG          300  /* drops 18-237 mg, activities >= 434 */
+#define LANDING_MG                 950  /* back to ~1 g after a deep free fall */
 #define SUDDEN_CHANGE_MG           600  /* jerk trigger for falls w/o free fall*/
 #define RAPID_ROTATION_MDPS     150000  /* 150 dps; sitting/bending < ~100    */
 #define STATIONARY_ROTATION_MDPS 20000  /* 20 dps                             */
@@ -55,8 +43,7 @@
 #define STATIONARY_ACCEL_MAX_MG   1150
 
 /* Added checks */
-#define POSTURE_CHANGE_DEG          45  /* upright -> lying                   */
-#define INACTIVITY_RATIO_PCT        70  /* share of window spent stationary   */
+#define POSTURE_CHANGE_DEG          65  /* upright -> lying                   */
 
 /* Post-alarm behaviour */
 #define RECOVERY_TILT_DEG           30  /* back near the pre-fall posture     */
@@ -105,12 +92,14 @@ typedef struct {
 	bool is_rapid_rotation;
 	bool is_stationary;
 	bool is_recovering;
+	bool moved_since_alarm;
 	bool free_fall_seen;
 
 	int prev_accel[3];
 	bool has_prev_accel;
 
-	int pre_fall_accel[3];       /* last stationary posture, the reference    */
+	int pre_fall_accel[3];  // last stationary posture, the reference
+	uint32_t reference_still_start_ms;
 	bool has_pre_fall_accel;
 
 	/* Per-sample features, also used for the UART report */
@@ -121,21 +110,22 @@ typedef struct {
 	/* Rotation over the last GYRO_HISTORY_LEN samples, so that rotation
 	 * happening just before the trigger still counts as evidence. */
 	int gyro_history[GYRO_HISTORY_LEN];
+	int accel_history[GYRO_HISTORY_LEN];
 	uint32_t gyro_history_idx;
 
 	/* Evidence collected during a suspected fall */
 	uint32_t free_fall_samples;
 	int peak_accel_mg;
+	int min_accel_mg;
 	int peak_gyro_mdps;
 	int32_t post_sum[3];
 	uint32_t post_samples;
-	uint32_t inactive_samples;
 
 	/* Result of the last evaluation, for the UART log */
 	int last_rotation_mdps;
 	int last_posture_deg;
 	int last_inactive_pct;
-	char last_reason[64];
+	char last_reason[96];
 } FallDetector;
 
 /*------------------------------- API ----------------------------------------*/
