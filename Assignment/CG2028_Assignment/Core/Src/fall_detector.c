@@ -425,7 +425,7 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 			break;
 		}
 		/* Self-recovery: back near the pre-fall posture and steady. */
-		if (!detector->is_stationary) {
+		if (detector->tilt_deg >= RECOVERY_LEAVE_DEG) {
 			detector->moved_since_alarm = true;
 		}
 		if (detector->moved_since_alarm &&

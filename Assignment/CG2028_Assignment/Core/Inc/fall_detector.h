@@ -50,8 +50,9 @@
 
 /* Post-alarm behaviour */
 #define RECOVERY_TILT_DEG           30  /* back near the pre-fall posture     */
+#define RECOVERY_LEAVE_DEG          45
 #define RECOVERY_HOLD_MS          3000
-#define LONG_LIE_MS              30000  /* escalate if still down after 30 s  */
+#define LONG_LIE_MS              15000  /* escalate if still down after 15 s  */
 #define REARM_DELAY_MS            2000  /* ignore triggers after clearing     */
 
 /* One second of rotation history (used when a fall starts with the impact). */
