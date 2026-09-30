@@ -1,45 +1,119 @@
 /******************************************************************************
  * @file           : main.c
  * @brief          : CG2028 Assignment - ElderCare Wearable Safety Companion
- * @author         : Hou Linxin
+ * @author         : Hou Linxin (starter), CG2028 group
  * (c) CG2028 Teaching Team
+ *
+ * Data flow, once every SAMPLE_PERIOD_MS:
+ *
+ *   LSM6DSL accel [mg] + gyro [mdps]
+ *        -> ewma_filter (ARM assembly, one recursive state per axis, 6 axes)
+ *        -> FallDetector_Update (fall_detector.c): features, phase machine
+ *        -> outputs: LED2 blink pattern, UART status and event log
+ *
+ * User button (blue, PC13):
+ *   short press during an alarm -> "I am OK" (acknowledge)
+ *   hold 2 s when normal        -> manual SOS
+ *
+ * LED2:
+ *   slow blink (1 s)     normal, or a possible fall still being checked
+ *   fast blink (150 ms)  fall confirmed
+ *   rapid blink (50 ms)  long lie or SOS
+ *
+ * Grove Buzzer on the Base Shield D3 port. Grove pin 1 (SIG) lands on
+ * Arduino D3 = PB0, driven with a square wave from TIM3_CH3 so the pitch
+ * (frequency) and volume (duty cycle) can be set:
+ *   silent                       normal, or a possible fall still being checked
+ *   200 ms beep / 1 s, 2.3 kHz   fall confirmed
+ *   100 ms on/off, 3 kHz         long lie or SOS
  ******************************************************************************/
 
 /*--------------------------- Includes ---------------------------------------*/
 #include "main.h"
+#include "fall_detector.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
 /*--------------------------- Configuration ----------------------------------*/
-#define EWMA_ALPHA_ACCEL_PERCENT   25
-#define EWMA_ALPHA_GYRO_PERCENT    25
-#define NORMAL_LED_DELAY_MS       1000
-#define FALL_LED_DELAY_MS          150
+/* EWMA smoothing. Time constant tau = -T / ln(1 - alpha) with T = 20 ms.
+ * Accelerometer 50 % -> tau ~ 29 ms: keeps most of a short impact spike
+ *   (an impact lasts only 20-60 ms; 25 % would cut a one-sample spike to a
+ *   quarter and soft landings would be missed).
+ * Gyroscope 30 % -> tau ~ 56 ms: rotation during a fall lasts 300-800 ms, so
+ *   heavier smoothing costs nothing and damps hand tremor and light shaking. */
+#define EWMA_ALPHA_ACCEL_PERCENT   50
+#define EWMA_ALPHA_GYRO_PERCENT    30
+
+#define NORMAL_LED_DELAY_MS      1000
+#define FALL_LED_DELAY_MS         150
+#define EMERGENCY_LED_DELAY_MS     50
+
+#define BUZZER_GPIO_Port          ARD_D3_GPIO_Port
+#define BUZZER_Pin                ARD_D3_Pin
+#define BUZZER_TIMER_TICK_HZ   1000000U /* 1 us steps; tones 16 Hz - 20 kHz */
+#define BUZZER_VOLUME_PERCENT     30   /* 100 = 50 % duty (loudest), 0 = mute */
+#define BUZZER_STARTUP_CHIRP_MS   100   /* confirms the wiring at power-up */
+#define BUZZER_FALL_FREQ_HZ       700   /* near the buzzer's resonance: loudest */
+#define BUZZER_FALL_ON_MS         200
+#define BUZZER_FALL_PERIOD_MS    1000
+#define BUZZER_EMERGENCY_FREQ_HZ 2000
+#define BUZZER_EMERGENCY_ON_MS    100
+#define BUZZER_EMERGENCY_PERIOD_MS 200
+
+#define ALERT_REPEAT_MS          1000
+#define EVAL_REPORT_PERIOD_MS     500
+#define BUTTON_DEBOUNCE_MS         30
+#define BUTTON_LONG_PRESS_MS     2000
+
+#define MG_TO_MPS2          (9.80665f / 1000.0f)
+
+typedef enum {
+	BUTTON_EVENT_NONE,
+	BUTTON_EVENT_SHORT,
+	BUTTON_EVENT_LONG
+} ButtonEvent;
 
 static void UART1_Init(void);
 static void UART_Send(const char *text);
+static void SystemClock_Config(void);
+static void Accelerometer_SetRange8g(void);
+static void LED_Update(FallPhase phase, uint32_t now_ms);
+static void Buzzer_Init(void);
+static void Buzzer_SetTone(uint32_t freq_hz);
+static void Buzzer_Update(FallPhase phase, uint32_t now_ms);
+static ButtonEvent Button_Poll(uint32_t now_ms);
+static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms);
+static void Report_Status(const FallDetector *detector, const int accel_mg[3],
+                          const int gyro_mdps[3], uint32_t now_ms);
+static void Report_Evaluation(const FallDetector *detector, uint32_t now_ms);
 
 extern int ewma_filter(int new_data, int old_output, int alpha_percent);
-//int ewma_filter_C(int new_data, int old_output, int alpha_percent);
+int ewma_filter_C(int new_data, int old_output, int alpha_percent);
 
 UART_HandleTypeDef huart1;
+TIM_HandleTypeDef htim3;
 
 int main(void)
 {
     HAL_Init();
+    SystemClock_Config();
     UART1_Init();
 
     BSP_LED_Init(LED2);
+    BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);
     BSP_ACCELERO_Init();
     BSP_GYRO_Init();
+    Accelerometer_SetRange8g();
     BSP_LED_Off(LED2);
+    Buzzer_Init();
 
-    /* Previous EWMA outputs. The first test/application sample starts from 0. */
+    /* Previous EWMA outputs: one independent recursive state per axis. */
     int accel_ewma_asm[3] = {0, 0, 0};
     int gyro_ewma_asm[3]  = {0, 0, 0};
 
@@ -47,20 +121,40 @@ int main(void)
     int accel_ewma_c[3] = {0, 0, 0};
     int gyro_ewma_c[3]  = {0, 0, 0};
 
-    unsigned long sample_number = 0;
+    FallDetector detector;
+    FallDetector_Init(&detector, HAL_GetTick());
+
+    UART_Send("\r\n=== ElderCare Wearable Safety Companion ===\r\n"
+              "Hold the board still and upright to set the reference posture.\r\n"
+              "Button: short press = I am OK, hold 2 s = SOS.\r\n");
+
+    uint32_t next_sample_ms = HAL_GetTick();
+    uint32_t last_report_ms = 0;
+    uint32_t last_alert_ms = 0;
+    bool asm_mismatch = false;
 
     while (1)
     {
+        /*---------------- Fixed-rate scheduling ----------------*/
+        while ((int32_t)(HAL_GetTick() - next_sample_ms) < 0)
+        {
+        }
+        next_sample_ms += SAMPLE_PERIOD_MS;
+        if ((int32_t)(HAL_GetTick() - next_sample_ms) > SAMPLE_PERIOD_MS)
+        {
+            next_sample_ms = HAL_GetTick();   /* fell behind, e.g. long print */
+        }
+        uint32_t now_ms = HAL_GetTick();
+
+        /*---------------- Sensor acquisition ----------------*/
         int16_t accel_raw_i16[3] = {0, 0, 0};
         float gyro_raw_float[3] = {0.0f, 0.0f, 0.0f};
         int gyro_raw_int[3] = {0, 0, 0};
 
-        BSP_ACCELERO_AccGetXYZ(accel_raw_i16);
-        BSP_GYRO_GetXYZ(gyro_raw_float);
+        BSP_ACCELERO_AccGetXYZ(accel_raw_i16);   /* mg   */
+        BSP_GYRO_GetXYZ(gyro_raw_float);         /* mdps */
 
-        /* The supplied BSP reports gyroscope readings as floating-point raw
-         * values. Convert them to signed integers before passing them to the
-         * integer assembly routine. */
+        /*---------------- EWMA filtering (assembly) ----------------*/
         for (int axis = 0; axis < 3; axis++)
         {
             gyro_raw_int[axis] = (int)gyro_raw_float[axis];
@@ -84,58 +178,71 @@ int main(void)
                 gyro_raw_int[axis],
                 gyro_ewma_c[axis],
                 EWMA_ALPHA_GYRO_PERCENT);
+
+            if ((accel_ewma_asm[axis] != accel_ewma_c[axis]) ||
+                (gyro_ewma_asm[axis] != gyro_ewma_c[axis]))
+            {
+                asm_mismatch = true;
+            }
         }
 
-        /* Accelerometer filtered readings are in meters per second squared. */
-        float accel_mps2[3] = {
-            accel_ewma_asm[0] * (9.80665f / 1000.0f),
-            accel_ewma_asm[1] * (9.80665f / 1000.0f),
-            accel_ewma_asm[2] * (9.80665f / 1000.0f)
-        };
-
-        /* Gyroscope filtered readings are in degrees per second. */
-        float gyro_dps[3] = {
-            gyro_ewma_asm[0] / 1000.0f,
-            gyro_ewma_asm[1] / 1000.0f,
-            gyro_ewma_asm[2] / 1000.0f
-        };
-
-        char buffer[320];
-        snprintf(buffer, sizeof(buffer),
-                 "Sample %lu\r\n"
-                 "Accel EWMA ASM [m/s^2]: X=%8.3f Y=%8.3f Z=%8.3f\r\n"
-                 "Gyro  EWMA ASM [dps]  : X=%8.3f Y=%8.3f Z=%8.3f\r\n",
-                 sample_number,
-                 accel_mps2[0], accel_mps2[1], accel_mps2[2],
-                 gyro_dps[0], gyro_dps[1], gyro_dps[2]);
-        UART_Send(buffer);
-
-        /* Optional debugging check. This confirms that the assembly routine
-         * matches the reference C routine for the current samples. */
-        if ((accel_ewma_asm[0] != accel_ewma_c[0]) ||
-            (accel_ewma_asm[1] != accel_ewma_c[1]) ||
-            (accel_ewma_asm[2] != accel_ewma_c[2]) ||
-            (gyro_ewma_asm[0] != gyro_ewma_c[0]) ||
-            (gyro_ewma_asm[1] != gyro_ewma_c[1]) ||
-            (gyro_ewma_asm[2] != gyro_ewma_c[2]))
+        /*---------------- Fall detection (filtered data only) ----------------*/
+        FallEvent event = FallDetector_Update(&detector, accel_ewma_asm,
+                                              gyro_ewma_asm, now_ms);
+        Report_Event(event, &detector, now_ms);
+        if (event != FALL_EVENT_NONE)
         {
-            UART_Send("WARNING: Assembly and C EWMA outputs do not match.\r\n");
+            last_report_ms = now_ms;
         }
 
-        /**************** Elderly wearable state logic starts here************************
-         * Compulsory requirements:
-         * 1. Use filtered accelerometer AND gyroscope readings.
-         * 2. Distinguish normal activity, near-fall movements, and a real fall.
-         * 3. Use a slow LED blink for normal operation and a fast blink after
-         *    a fall is detected.
-         *********************************************************************/
+        ButtonEvent button = Button_Poll(now_ms);
+        if (button == BUTTON_EVENT_SHORT)
+        {
+            Report_Event(FallDetector_Acknowledge(&detector, now_ms), &detector, now_ms);
+        }
+        else if (button == BUTTON_EVENT_LONG)
+        {
+            Report_Event(FallDetector_RequestSOS(&detector, now_ms), &detector, now_ms);
+        }
 
-        int fall_detected = 0;  /* TODO: replace with your fall-detection logic */
+        /*---------------- Outputs ----------------*/
+        LED_Update(detector.phase, now_ms);
+        Buzzer_Update(detector.phase, now_ms);
 
-        BSP_LED_Toggle(LED2);
-        HAL_Delay(fall_detected ? FALL_LED_DELAY_MS : NORMAL_LED_DELAY_MS);
+        bool evaluating = (detector.phase == FALL_PHASE_AWAIT_IMPACT) ||
+                          (detector.phase == FALL_PHASE_POST_IMPACT);
 
-        sample_number++;
+        if (FallDetector_IsAlarming(&detector))
+        {
+            if ((now_ms - last_alert_ms) >= ALERT_REPEAT_MS)
+            {
+                last_alert_ms = now_ms;
+                char buffer[96];
+                snprintf(buffer, sizeof(buffer),
+                         "!!! %s - %lu s - press USER button if OK\r\n",
+                         FallDetector_PhaseName(detector.phase),
+                         (unsigned long)((now_ms - detector.phase_start_ms) / 1000U));
+                UART_Send(buffer);
+            }
+        }
+        else if (evaluating)
+        {
+            if ((now_ms - last_report_ms) >= EVAL_REPORT_PERIOD_MS)
+            {
+                last_report_ms = now_ms;
+                Report_Evaluation(&detector, now_ms);
+            }
+        }
+        else if ((now_ms - last_report_ms) >= UART_REPORT_PERIOD_MS)
+        {
+            last_report_ms = now_ms;
+            Report_Status(&detector, accel_ewma_asm, gyro_ewma_asm, now_ms);
+            if (asm_mismatch)
+            {
+                UART_Send("WARNING: Assembly and C EWMA outputs do not match.\r\n");
+                asm_mismatch = false;
+            }
+        }
     }
 }
 
@@ -146,6 +253,339 @@ int ewma_filter_C(int new_data, int old_output, int alpha_percent)
     int numerator = alpha_percent * new_data
                   + (100 - alpha_percent) * old_output;
     return numerator / 100;
+}
+
+/* The BSP configures the accelerometer for +/-2 g, which clips fall impacts
+ * (2-6 g) at 2 g. Switch to +/-8 g; the BSP read function re-reads this
+ * register every sample and applies the matching sensitivity, so the readings
+ * stay in mg. */
+static void Accelerometer_SetRange8g(void)
+{
+    const uint8_t full_scale_mask = 0x0C;   /* FS_XL bits of CTRL1_XL */
+    uint8_t ctrl = SENSOR_IO_Read(LSM6DSL_ACC_GYRO_I2C_ADDRESS_LOW,
+                                  LSM6DSL_ACC_GYRO_CTRL1_XL);
+    ctrl = (uint8_t)((ctrl & ~full_scale_mask) | LSM6DSL_ACC_FULLSCALE_8G);
+    SENSOR_IO_Write(LSM6DSL_ACC_GYRO_I2C_ADDRESS_LOW,
+                    LSM6DSL_ACC_GYRO_CTRL1_XL, ctrl);
+}
+
+/* Non-blocking LED blinking: the rate follows the phase and never delays
+ * sampling. A change of pattern takes effect immediately. */
+static void LED_Update(FallPhase phase, uint32_t now_ms)
+{
+    static uint32_t last_toggle_ms = 0;
+    static uint32_t current_period_ms = NORMAL_LED_DELAY_MS;
+
+    uint32_t period_ms;
+    switch (phase)
+    {
+    case FALL_PHASE_ALARM:
+        period_ms = FALL_LED_DELAY_MS;
+        break;
+    case FALL_PHASE_LONG_LIE:
+    case FALL_PHASE_SOS:
+        period_ms = EMERGENCY_LED_DELAY_MS;
+        break;
+    default:
+        period_ms = NORMAL_LED_DELAY_MS;
+        break;
+    }
+
+    if (period_ms != current_period_ms)
+    {
+        current_period_ms = period_ms;
+        last_toggle_ms = now_ms - period_ms;   /* toggle right away */
+    }
+    if ((now_ms - last_toggle_ms) >= current_period_ms)
+    {
+        last_toggle_ms = now_ms;
+        BSP_LED_Toggle(LED2);
+    }
+}
+
+/* PB0 is TIM3_CH3 (AF2). TIM3 counts 1 us ticks; the auto-reload sets the
+ * tone period and the compare value sets the duty cycle. A short chirp at
+ * start-up confirms the wiring before monitoring begins. */
+static void Buzzer_Init(void)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_TIM3_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+    GPIO_InitStruct.Pin = BUZZER_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(BUZZER_GPIO_Port, &GPIO_InitStruct);
+
+    /* APB1 is not divided, so the TIM3 clock equals PCLK1 (80 MHz). */
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = HAL_RCC_GetPCLK1Freq() / BUZZER_TIMER_TICK_HZ - 1U;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim3.Init.Period = 0xFFFF;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_PWM_Init(&htim3) != HAL_OK) { while (1) { } }
+
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode = TIM_OCMODE_PWM1;
+    oc.Pulse = 0;                          /* output held low: silent */
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_3) != HAL_OK) { while (1) { } }
+    if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3) != HAL_OK) { while (1) { } }
+
+    Buzzer_SetTone(BUZZER_FALL_FREQ_HZ);
+    HAL_Delay(BUZZER_STARTUP_CHIRP_MS);
+    Buzzer_SetTone(0);
+}
+
+/* Plays a square wave at freq_hz (16 Hz - 20 kHz), or silences the buzzer
+ * when freq_hz is 0. Registers are only touched when the tone changes. */
+static void Buzzer_SetTone(uint32_t freq_hz)
+{
+    static uint32_t current_hz = 0;
+
+    if (freq_hz == current_hz)
+    {
+        return;
+    }
+    current_hz = freq_hz;
+
+    if (freq_hz == 0U)
+    {
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0U);
+    }
+    else
+    {
+        uint32_t period_ticks = BUZZER_TIMER_TICK_HZ / freq_hz;
+        __HAL_TIM_SET_AUTORELOAD(&htim3, period_ticks - 1U);
+        /* A 50 % duty cycle drives the buzzer hardest; a narrower pulse
+         * carries less energy at the tone frequency, so it sounds quieter. */
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3,
+                              period_ticks * BUZZER_VOLUME_PERCENT / 200U);
+    }
+    /* Load the preloaded values now rather than at the end of the old period. */
+    HAL_TIM_GenerateEvent(&htim3, TIM_EVENTSOURCE_UPDATE);
+}
+
+/* Non-blocking beep pattern that follows the phase, like LED_Update. A new
+ * pattern starts with a beep straight away. */
+static void Buzzer_Update(FallPhase phase, uint32_t now_ms)
+{
+    static FallPhase current_phase = FALL_PHASE_MONITORING;
+    static uint32_t pattern_start_ms = 0;
+
+    uint32_t freq_hz;
+    uint32_t on_ms;
+    uint32_t period_ms;
+    switch (phase)
+    {
+    case FALL_PHASE_ALARM:
+        freq_hz = BUZZER_FALL_FREQ_HZ;
+        on_ms = BUZZER_FALL_ON_MS;
+        period_ms = BUZZER_FALL_PERIOD_MS;
+        break;
+    case FALL_PHASE_LONG_LIE:
+    case FALL_PHASE_SOS:
+        freq_hz = BUZZER_EMERGENCY_FREQ_HZ;
+        on_ms = BUZZER_EMERGENCY_ON_MS;
+        period_ms = BUZZER_EMERGENCY_PERIOD_MS;
+        break;
+    default:
+        freq_hz = 0;
+        on_ms = 0;
+        period_ms = 1;
+        break;
+    }
+
+    if (phase != current_phase)
+    {
+        current_phase = phase;
+        pattern_start_ms = now_ms;
+    }
+
+    bool on = ((now_ms - pattern_start_ms) % period_ms) < on_ms;
+    Buzzer_SetTone(on ? freq_hz : 0U);
+}
+
+/* Debounced user button (active low). SHORT is reported on release, LONG once
+ * the button has been held for BUTTON_LONG_PRESS_MS. */
+static ButtonEvent Button_Poll(uint32_t now_ms)
+{
+    static bool stable_pressed = false;
+    static bool last_raw = false;
+    static bool long_reported = false;
+    static uint32_t last_change_ms = 0;
+    static uint32_t press_start_ms = 0;
+
+    bool raw = (BSP_PB_GetState(BUTTON_USER) == GPIO_PIN_RESET);
+    ButtonEvent event = BUTTON_EVENT_NONE;
+
+    if (raw != last_raw)
+    {
+        last_raw = raw;
+        last_change_ms = now_ms;
+    }
+
+    if ((raw != stable_pressed) && ((now_ms - last_change_ms) >= BUTTON_DEBOUNCE_MS))
+    {
+        stable_pressed = raw;
+        if (stable_pressed)
+        {
+            press_start_ms = now_ms;
+            long_reported = false;
+        }
+        else if (!long_reported)
+        {
+            event = BUTTON_EVENT_SHORT;
+        }
+    }
+
+    if (stable_pressed && !long_reported &&
+        ((now_ms - press_start_ms) >= BUTTON_LONG_PRESS_MS))
+    {
+        long_reported = true;
+        event = BUTTON_EVENT_LONG;
+    }
+    return event;
+}
+
+static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms)
+{
+    char buffer[200];
+    buffer[0] = '\0';
+
+    switch (event)
+    {
+    case FALL_EVENT_READY:
+        snprintf(buffer, sizeof(buffer),
+                 "Reference posture set to (%d, %d, %d) mg. Monitoring.\r\n",
+                 detector->pre_fall_accel[0], detector->pre_fall_accel[1],
+                 detector->pre_fall_accel[2]);
+        break;
+    case FALL_EVENT_FREE_FALL:
+        snprintf(buffer, sizeof(buffer),
+                 ">> Possible fall (|a| = %d mg, |w| = %d dps) - waiting for impact\r\n",
+                 detector->accel_mag_mg, detector->gyro_mag_mdps / 1000);
+        break;
+    case FALL_EVENT_IMPACT:
+        snprintf(buffer, sizeof(buffer),
+                 ">> Impact %.2f g - checking rotation, posture, inactivity\r\n",
+                 detector->accel_mag_mg / 1000.0f);
+        break;
+    case FALL_EVENT_FALL_CONFIRMED:
+        snprintf(buffer, sizeof(buffer),
+                 "*** FALL CONFIRMED: impact %.2f g, rotation %d dps, "
+                 "posture change %d deg, inactive %d%% ***\r\n",
+                 detector->peak_accel_mg / 1000.0f,
+                 detector->last_rotation_mdps / 1000,
+                 detector->last_posture_deg, detector->last_inactive_pct);
+        break;
+    case FALL_EVENT_NEAR_FALL:
+        snprintf(buffer, sizeof(buffer),
+                 "-- Near-fall rejected (%s): rotation %d dps, "
+                 "posture change %d deg, inactive %d%%\r\n",
+                 detector->last_reason, detector->last_rotation_mdps / 1000,
+                 detector->last_posture_deg, detector->last_inactive_pct);
+        break;
+    case FALL_EVENT_RECOVERED:
+        snprintf(buffer, sizeof(buffer),
+                 "-- Recovered: upright and steady for %lu s. Monitoring.\r\n",
+                 (unsigned long)(RECOVERY_HOLD_MS / 1000U));
+        break;
+    case FALL_EVENT_ACKNOWLEDGED:
+        snprintf(buffer, sizeof(buffer), "-- Alarm acknowledged by user. Monitoring.\r\n");
+        break;
+    case FALL_EVENT_LONG_LIE:
+        snprintf(buffer, sizeof(buffer),
+                 "!!! LONG LIE: no recovery %lu s after the fall - summon help !!!\r\n",
+                 (unsigned long)(LONG_LIE_MS / 1000U));
+        break;
+    case FALL_EVENT_SOS:
+        snprintf(buffer, sizeof(buffer), "!!! SOS requested by user !!!\r\n");
+        break;
+    case FALL_EVENT_NONE:
+    default:
+        break;
+    }
+
+    if (buffer[0] != '\0')
+    {
+        char stamped[220];
+        snprintf(stamped, sizeof(stamped), "[%6lu.%02lu s] %s",
+                 (unsigned long)(now_ms / 1000U),
+                 (unsigned long)((now_ms % 1000U) / 10U), buffer);
+        UART_Send(stamped);
+    }
+}
+
+static void Report_Status(const FallDetector *detector, const int accel_mg[3],
+                          const int gyro_mdps[3], uint32_t now_ms)
+{
+    char buffer[220];
+    snprintf(buffer, sizeof(buffer),
+             "[%6lu.%02lu s] %-13s %6.1f s |a|=%.2f g |w|=%4d dps tilt=%3d deg | "
+             "A[m/s^2] %6.2f %6.2f %6.2f | G[dps] %7.1f %7.1f %7.1f\r\n",
+             (unsigned long)(now_ms / 1000U),
+             (unsigned long)((now_ms % 1000U) / 10U),
+             FallDetector_PhaseName(detector->phase),
+             (now_ms - detector->phase_start_ms) / 1000.0f,
+             detector->accel_mag_mg / 1000.0f,
+             detector->gyro_mag_mdps / 1000,
+             detector->tilt_deg,
+             accel_mg[0] * MG_TO_MPS2, accel_mg[1] * MG_TO_MPS2, accel_mg[2] * MG_TO_MPS2,
+             gyro_mdps[0] / 1000.0f, gyro_mdps[1] / 1000.0f, gyro_mdps[2] / 1000.0f);
+    UART_Send(buffer);
+}
+
+static void Report_Evaluation(const FallDetector *detector, uint32_t now_ms)
+{
+    char buffer[180];
+    uint32_t in_phase_ms = now_ms - detector->phase_start_ms;
+    const char *deep = (detector->min_accel_mg < DEEP_FREE_FALL_MG) ? " (deep)" : "";
+
+    if (detector->phase == FALL_PHASE_AWAIT_IMPACT)
+    {
+        snprintf(buffer, sizeof(buffer),
+                 "[%6lu.%02lu s] %-9s %4.1f/%.1f s | waiting for impact | |a|=%.2f g | "
+                 "lowest |a| %d mg%s | rotation %d dps\r\n",
+                 (unsigned long)(now_ms / 1000U),
+                 (unsigned long)((now_ms % 1000U) / 10U),
+                 FallDetector_PhaseName(detector->phase),
+                 in_phase_ms / 1000.0f, IMPACT_WINDOW_MS / 1000.0f,
+                 detector->accel_mag_mg / 1000.0f,
+                 detector->min_accel_mg, deep,
+                 detector->peak_gyro_mdps / 1000);
+    }
+    else
+    {
+        char still[32];
+        if (in_phase_ms < POST_IMPACT_SETTLE_MS)
+        {
+            snprintf(still, sizeof(still), "settling");
+        }
+        else
+        {
+            uint32_t still_ms = (detector->post_samples > 0U)
+                              ? (now_ms - detector->inactivity_start_ms) : 0U;
+            snprintf(still, sizeof(still), "still %.2f/%.2f s",
+                     still_ms / 1000.0f, INACTIVITY_REQUIRED_MS / 1000.0f);
+        }
+        snprintf(buffer, sizeof(buffer),
+                 "[%6lu.%02lu s] %-9s %4.1f/%.0f s | %s | rotation %d dps | "
+                 "lowest |a| %d mg%s | tilt %d deg\r\n",
+                 (unsigned long)(now_ms / 1000U),
+                 (unsigned long)((now_ms % 1000U) / 10U),
+                 FallDetector_PhaseName(detector->phase),
+                 in_phase_ms / 1000.0f, POST_IMPACT_WINDOW_MS / 1000.0f,
+                 still,
+                 detector->peak_gyro_mdps / 1000,
+                 detector->min_accel_mg, deep,
+                 detector->tilt_deg);
+    }
+    UART_Send(buffer);
 }
 
 static void UART_Send(const char *text)
@@ -181,6 +621,36 @@ static void UART1_Init(void)
     {
         while (1) { }
     }
+}
+
+static void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    osc.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+    osc.MSIState = RCC_MSI_ON;
+    osc.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
+    osc.MSIClockRange = RCC_MSIRANGE_6;  // 4 MHz
+    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+    osc.PLL.PLLM = 1;
+    osc.PLL.PLLN = 40;  // VCO 160 MHz
+    osc.PLL.PLLP = 2;
+    osc.PLL.PLLQ = RCC_PLLQ_DIV2;
+    osc.PLL.PLLR = RCC_PLLR_DIV2;  // SYSCLK 80 MHz
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) { while (1) { } }
+
+    clk.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
+                    RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK) { while (1) { } }
 }
 
 /* Do not modify these lines. They suppress UART-related warnings. */
