@@ -134,14 +134,26 @@ static int recent_peak_gyro(const FallDetector *detector)
 	return peak;
 }
 
+static int recent_min_accel(const FallDetector *detector)
+{
+	int lowest = detector->accel_history[0];
+
+	for (uint32_t i = 1; i < GYRO_HISTORY_LEN; i++) {
+		if (detector->accel_history[i] < lowest) {
+			lowest = detector->accel_history[i];
+		}
+	}
+	return lowest;
+}
+
 static void start_suspected_fall(FallDetector *detector, uint32_t now_ms)
 {
 	detector->free_fall_samples = 0;
 	detector->peak_accel_mg = detector->accel_mag_mg;
 	detector->peak_gyro_mdps = recent_peak_gyro(detector);
+	detector->min_accel_mg = recent_min_accel(detector);
 	detector->post_sum[0] = detector->post_sum[1] = detector->post_sum[2] = 0;
 	detector->post_samples = 0;
-	detector->inactive_samples = 0;
 	detector->is_inactive = false;
 	detector->inactivity_start_ms = now_ms;
 	detector->last_reason[0] = '\0';
@@ -186,18 +198,17 @@ static FallEvent evaluate_suspected_fall(FallDetector *detector, uint32_t now_ms
 	detector->last_posture_deg = detector->has_pre_fall_accel
 	                           ? angle_between_deg(mean_posture, detector->pre_fall_accel)
 	                           : 0;
-	detector->last_inactive_pct = (detector->post_samples > 0)
-	                            ? (int)((detector->inactive_samples * 100U) / detector->post_samples)
-	                            : 0;
+	detector->last_inactive_pct = detector->is_inactive ? 100 : 0;
 
 	bool rotation_ok = (detector->peak_gyro_mdps >= RAPID_ROTATION_MDPS);
 	bool posture_ok = (detector->last_posture_deg >= POSTURE_CHANGE_DEG);
-	bool inactivity_ok = detector->is_inactive &&
-	                     (detector->last_inactive_pct >= INACTIVITY_RATIO_PCT);
+	bool dropped = (detector->min_accel_mg < DEEP_FREE_FALL_MG);
+	bool inactivity_ok = detector->is_inactive;
 
-	if (rotation_ok && posture_ok && inactivity_ok) {
+	if (rotation_ok && (posture_ok || dropped) && inactivity_ok) {
 		detector->alarm_ms = now_ms;
 		detector->is_recovering = false;
+		detector->moved_since_alarm = false;
 		enter_phase(detector, FALL_PHASE_ALARM, now_ms);
 		return FALL_EVENT_FALL_CONFIRMED;
 	}
@@ -206,8 +217,8 @@ static FallEvent evaluate_suspected_fall(FallDetector *detector, uint32_t now_ms
 	if (!rotation_ok) {
 		append_reason(detector->last_reason, "rotation too slow");
 	}
-	if (!posture_ok) {
-		append_reason(detector->last_reason, "no posture change");
+	if (!posture_ok && !dropped) {
+		append_reason(detector->last_reason, "no posture change or drop");
 	}
 	if (!inactivity_ok) {
 		append_reason(detector->last_reason, "still moving after impact");
@@ -237,6 +248,7 @@ static void update_features(FallDetector *detector, const int accel_mg[3],
 	                   : 0;
 
 	detector->gyro_history[detector->gyro_history_idx] = detector->gyro_mag_mdps;
+	detector->accel_history[detector->gyro_history_idx] = detector->accel_mag_mg;
 	detector->gyro_history_idx = (detector->gyro_history_idx + 1U) % GYRO_HISTORY_LEN;
 
 	if (detector->gyro_mag_mdps > detector->peak_gyro_mdps) {
@@ -244,6 +256,9 @@ static void update_features(FallDetector *detector, const int accel_mg[3],
 	}
 	if (detector->accel_mag_mg > detector->peak_accel_mg) {
 		detector->peak_accel_mg = detector->accel_mag_mg;
+	}
+	if (detector->accel_mag_mg < detector->min_accel_mg) {
+		detector->min_accel_mg = detector->accel_mag_mg;
 	}
 }
 
@@ -255,6 +270,11 @@ void FallDetector_Init(FallDetector *detector, uint32_t now_ms)
 	detector->phase = FALL_PHASE_MONITORING;
 	detector->startup_timer_ms = now_ms;
 	detector->phase_start_ms = now_ms;
+	detector->reference_still_start_ms = now_ms;
+
+	for (uint32_t i = 0; i < GYRO_HISTORY_LEN; i++) {
+		detector->accel_history[i] = 1000;
+	}
 }
 
 FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
@@ -270,7 +290,9 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 	case FALL_PHASE_MONITORING:
 		/* The most recent stationary posture is the reference that a fall is
 		 * measured against, so it follows slow, deliberate posture changes. */
-		if (detector->is_stationary) {
+		if (!detector->is_stationary) {
+			detector->reference_still_start_ms = now_ms;
+		} else if ((now_ms - detector->reference_still_start_ms) >= REFERENCE_HOLD_MS) {
 			for (int i = 0; i < 3; i++) {
 				detector->pre_fall_accel[i] = accel_mg[i];
 			}
@@ -318,6 +340,10 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 		 * loss of support has already been established. */
 		int impact_threshold = detector->free_fall_seen ? SOFT_IMPACT_MG : IMPACT_MG;
 
+		if (detector->min_accel_mg < DEEP_FREE_FALL_MG) {
+			impact_threshold = LANDING_MG;
+		}
+
 		if (detector->accel_mag_mg >= impact_threshold) {
 			detector->impact_ms = now_ms;
 			enter_phase(detector, FALL_PHASE_POST_IMPACT, now_ms);
@@ -335,22 +361,23 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 
 	case FALL_PHASE_POST_IMPACT:
 		if (in_phase_ms >= POST_IMPACT_SETTLE_MS) {
-			if (detector->post_samples == 0) {
-				detector->inactivity_start_ms = now_ms;
-			}
-
-			for (int i = 0; i < 3; i++) {
-				detector->post_sum[i] += accel_mg[i];
-			}
-			detector->post_samples++;
-
 			if (detector->is_stationary) {
-				detector->inactive_samples++;
+				if (detector->post_samples == 0) {
+					detector->inactivity_start_ms = now_ms;
+				}
+				for (int i = 0; i < 3; i++) {
+					detector->post_sum[i] += accel_mg[i];
+				}
+				detector->post_samples++;
+
 				if ((now_ms - detector->inactivity_start_ms) >= INACTIVITY_REQUIRED_MS) {
 					detector->is_inactive = true;
+					event = evaluate_suspected_fall(detector, now_ms);
+					break;
 				}
 			} else {
-				detector->inactivity_start_ms = now_ms;
+				detector->post_sum[0] = detector->post_sum[1] = detector->post_sum[2] = 0;
+				detector->post_samples = 0;
 			}
 		}
 		if (in_phase_ms >= POST_IMPACT_WINDOW_MS) {
@@ -365,7 +392,11 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 			break;
 		}
 		/* Self-recovery: back near the pre-fall posture and steady. */
-		if (detector->tilt_deg < RECOVERY_TILT_DEG && detector->is_stationary) {
+		if (!detector->is_stationary) {
+			detector->moved_since_alarm = true;
+		}
+		if (detector->moved_since_alarm &&
+		    detector->tilt_deg < RECOVERY_TILT_DEG && detector->is_stationary) {
 			if (!detector->is_recovering) {
 				detector->is_recovering = true;
 				detector->recovery_start_ms = now_ms;
