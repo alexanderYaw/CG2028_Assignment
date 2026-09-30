@@ -20,8 +20,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* 0: normal demo build. 1: CSV stream for recording trials. */
-#define DATA_LOG_MODE              1
+/* 0: normal demo build - LEAVE AT 0 for the demo and the submission.
+ * 1: CSV stream for recording trials with Part2_Simulation/capture.py. */
+#define DATA_LOG_MODE              0
 
 typedef struct {
 	uint32_t  t_ms;
