@@ -32,6 +32,7 @@
 #include "main.h"
 #include "fall_detector.h"
 #include "data_logger.h"
+#include "oled_display.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 
@@ -114,6 +115,10 @@ int main(void)
     BSP_LED_Off(LED2);
     Buzzer_Init();
 
+    /* Enhancement: status display on I2C1 (PB8/PB9). A missing panel is not
+     * fatal - everything else still runs. */
+    bool oled_present = OLED_Init();
+
     /* Previous EWMA outputs: one independent recursive state per axis. */
     int accel_ewma_asm[3] = {0, 0, 0};
     int gyro_ewma_asm[3]  = {0, 0, 0};
@@ -137,6 +142,8 @@ int main(void)
         UART_Send("\r\n=== ElderCare Wearable Safety Companion ===\r\n"
                   "Hold the board still and upright to set the reference posture.\r\n"
                   "Button: short press = I am OK, hold 2 s = SOS.\r\n");
+        UART_Send(oled_present ? "OLED display detected on I2C1.\r\n"
+                               : "No OLED on I2C1 - continuing without display.\r\n");
     }
 
     uint32_t next_sample_ms = HAL_GetTick();
@@ -223,6 +230,7 @@ int main(void)
         /*---------------- Outputs ----------------*/
         LED_Update(detector.phase, now_ms);
         Buzzer_Update(detector.phase, now_ms);
+        OLED_Update(&detector, now_ms);
 
         if (DATA_LOG_MODE)
         {
