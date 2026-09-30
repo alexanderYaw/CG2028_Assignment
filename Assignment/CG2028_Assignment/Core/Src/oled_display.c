@@ -136,7 +136,11 @@ static bool oled_ready;
 
 static bool oled_write(uint8_t control, const uint8_t *payload, uint16_t length)
 {
-    uint8_t buffer[1 + OLED_COLS * FONT_WIDTH + 8];
+    /* One control byte plus a full row: every column is FONT_WIDTH pixel
+     * columns plus one spacing column. Sizing this for FONT_WIDTH alone made
+     * every row write fail the check below, so the panel showed its
+     * uninitialised RAM. */
+    uint8_t buffer[1 + OLED_COLS * (FONT_WIDTH + 1)];
 
     if ((size_t)length + 1U > sizeof(buffer))
     {
