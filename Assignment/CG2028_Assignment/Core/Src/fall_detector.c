@@ -104,11 +104,11 @@ static int angle_between_deg(const int a[3], const int b[3])
 		dot += (float)a[i] * (float)b[i];
 	}
 
-	float norm2 = (float)square_vector_magnitude(a) * (float)square_vector_magnitude(b);
-	if (norm2 < 1.0f) {
+	float norm = (float)isqrt_u64(square_vector_magnitude(a)) * (float)isqrt_u64(square_vector_magnitude(b));
+	if (norm < 1.0f) {
 		return 0;
 	}
-	return acos_deg(dot / sqrt_positive(norm2));
+	return acos_deg(dot / norm);
 }
 
 /*--------------------------- Internal helpers -------------------------------*/
@@ -335,6 +335,10 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 
 	case FALL_PHASE_POST_IMPACT:
 		if (in_phase_ms >= POST_IMPACT_SETTLE_MS) {
+			if (detector->post_samples == 0) {
+				detector->inactivity_start_ms = now_ms;
+			}
+
 			for (int i = 0; i < 3; i++) {
 				detector->post_sum[i] += accel_mg[i];
 			}
@@ -400,9 +404,10 @@ FallEvent FallDetector_Acknowledge(FallDetector *detector, uint32_t now_ms)
 
 FallEvent FallDetector_RequestSOS(FallDetector *detector, uint32_t now_ms)
 {
-	if (FallDetector_IsAlarming(detector)) {
-		return FallDetector_Acknowledge(detector, now_ms);
+	if (detector->phase == FALL_PHASE_SOS) {
+		return FALL_EVENT_NONE;
 	}
+
 	enter_phase(detector, FALL_PHASE_SOS, now_ms);
 	return FALL_EVENT_SOS;
 }
