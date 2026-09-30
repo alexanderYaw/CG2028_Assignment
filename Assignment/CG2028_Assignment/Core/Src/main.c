@@ -19,6 +19,13 @@
  *   slow blink (1 s)     normal, or a possible fall still being checked
  *   fast blink (150 ms)  fall confirmed
  *   rapid blink (50 ms)  long lie or SOS
+ *
+ * Grove Buzzer on the Base Shield D3 port. Grove pin 1 (SIG) lands on
+ * Arduino D3 = PB0, driven with a square wave from TIM3_CH3 so the pitch
+ * (frequency) and volume (duty cycle) can be set:
+ *   silent                       normal, or a possible fall still being checked
+ *   200 ms beep / 1 s, 2.3 kHz   fall confirmed
+ *   100 ms on/off, 3 kHz         long lie or SOS
  ******************************************************************************/
 
 /*--------------------------- Includes ---------------------------------------*/
@@ -47,6 +54,18 @@
 #define FALL_LED_DELAY_MS         150
 #define EMERGENCY_LED_DELAY_MS     50
 
+#define BUZZER_GPIO_Port          ARD_D3_GPIO_Port
+#define BUZZER_Pin                ARD_D3_Pin
+#define BUZZER_TIMER_TICK_HZ   1000000U /* 1 us steps; tones 16 Hz - 20 kHz */
+#define BUZZER_VOLUME_PERCENT     30   /* 100 = 50 % duty (loudest), 0 = mute */
+#define BUZZER_STARTUP_CHIRP_MS   100   /* confirms the wiring at power-up */
+#define BUZZER_FALL_FREQ_HZ       700   /* near the buzzer's resonance: loudest */
+#define BUZZER_FALL_ON_MS         200
+#define BUZZER_FALL_PERIOD_MS    1000
+#define BUZZER_EMERGENCY_FREQ_HZ 2000
+#define BUZZER_EMERGENCY_ON_MS    100
+#define BUZZER_EMERGENCY_PERIOD_MS 200
+
 #define ALERT_REPEAT_MS          1000
 #define EVAL_REPORT_PERIOD_MS     500
 #define BUTTON_DEBOUNCE_MS         30
@@ -65,6 +84,9 @@ static void UART_Send(const char *text);
 static void SystemClock_Config(void);
 static void Accelerometer_SetRange8g(void);
 static void LED_Update(FallPhase phase, uint32_t now_ms);
+static void Buzzer_Init(void);
+static void Buzzer_SetTone(uint32_t freq_hz);
+static void Buzzer_Update(FallPhase phase, uint32_t now_ms);
 static ButtonEvent Button_Poll(uint32_t now_ms);
 static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms);
 static void Report_Status(const FallDetector *detector, const int accel_mg[3],
@@ -75,6 +97,7 @@ extern int ewma_filter(int new_data, int old_output, int alpha_percent);
 int ewma_filter_C(int new_data, int old_output, int alpha_percent);
 
 UART_HandleTypeDef huart1;
+TIM_HandleTypeDef htim3;
 
 int main(void)
 {
@@ -88,6 +111,7 @@ int main(void)
     BSP_GYRO_Init();
     Accelerometer_SetRange8g();
     BSP_LED_Off(LED2);
+    Buzzer_Init();
 
     /* Previous EWMA outputs: one independent recursive state per axis. */
     int accel_ewma_asm[3] = {0, 0, 0};
@@ -183,6 +207,7 @@ int main(void)
 
         /*---------------- Outputs ----------------*/
         LED_Update(detector.phase, now_ms);
+        Buzzer_Update(detector.phase, now_ms);
 
         bool evaluating = (detector.phase == FALL_PHASE_AWAIT_IMPACT) ||
                           (detector.phase == FALL_PHASE_POST_IMPACT);
@@ -276,6 +301,113 @@ static void LED_Update(FallPhase phase, uint32_t now_ms)
         last_toggle_ms = now_ms;
         BSP_LED_Toggle(LED2);
     }
+}
+
+/* PB0 is TIM3_CH3 (AF2). TIM3 counts 1 us ticks; the auto-reload sets the
+ * tone period and the compare value sets the duty cycle. A short chirp at
+ * start-up confirms the wiring before monitoring begins. */
+static void Buzzer_Init(void)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_TIM3_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+    GPIO_InitStruct.Pin = BUZZER_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(BUZZER_GPIO_Port, &GPIO_InitStruct);
+
+    /* APB1 is not divided, so the TIM3 clock equals PCLK1 (80 MHz). */
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = HAL_RCC_GetPCLK1Freq() / BUZZER_TIMER_TICK_HZ - 1U;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim3.Init.Period = 0xFFFF;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_PWM_Init(&htim3) != HAL_OK) { while (1) { } }
+
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode = TIM_OCMODE_PWM1;
+    oc.Pulse = 0;                          /* output held low: silent */
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_3) != HAL_OK) { while (1) { } }
+    if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3) != HAL_OK) { while (1) { } }
+
+    Buzzer_SetTone(BUZZER_FALL_FREQ_HZ);
+    HAL_Delay(BUZZER_STARTUP_CHIRP_MS);
+    Buzzer_SetTone(0);
+}
+
+/* Plays a square wave at freq_hz (16 Hz - 20 kHz), or silences the buzzer
+ * when freq_hz is 0. Registers are only touched when the tone changes. */
+static void Buzzer_SetTone(uint32_t freq_hz)
+{
+    static uint32_t current_hz = 0;
+
+    if (freq_hz == current_hz)
+    {
+        return;
+    }
+    current_hz = freq_hz;
+
+    if (freq_hz == 0U)
+    {
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0U);
+    }
+    else
+    {
+        uint32_t period_ticks = BUZZER_TIMER_TICK_HZ / freq_hz;
+        __HAL_TIM_SET_AUTORELOAD(&htim3, period_ticks - 1U);
+        /* A 50 % duty cycle drives the buzzer hardest; a narrower pulse
+         * carries less energy at the tone frequency, so it sounds quieter. */
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3,
+                              period_ticks * BUZZER_VOLUME_PERCENT / 200U);
+    }
+    /* Load the preloaded values now rather than at the end of the old period. */
+    HAL_TIM_GenerateEvent(&htim3, TIM_EVENTSOURCE_UPDATE);
+}
+
+/* Non-blocking beep pattern that follows the phase, like LED_Update. A new
+ * pattern starts with a beep straight away. */
+static void Buzzer_Update(FallPhase phase, uint32_t now_ms)
+{
+    static FallPhase current_phase = FALL_PHASE_MONITORING;
+    static uint32_t pattern_start_ms = 0;
+
+    uint32_t freq_hz;
+    uint32_t on_ms;
+    uint32_t period_ms;
+    switch (phase)
+    {
+    case FALL_PHASE_ALARM:
+        freq_hz = BUZZER_FALL_FREQ_HZ;
+        on_ms = BUZZER_FALL_ON_MS;
+        period_ms = BUZZER_FALL_PERIOD_MS;
+        break;
+    case FALL_PHASE_LONG_LIE:
+    case FALL_PHASE_SOS:
+        freq_hz = BUZZER_EMERGENCY_FREQ_HZ;
+        on_ms = BUZZER_EMERGENCY_ON_MS;
+        period_ms = BUZZER_EMERGENCY_PERIOD_MS;
+        break;
+    default:
+        freq_hz = 0;
+        on_ms = 0;
+        period_ms = 1;
+        break;
+    }
+
+    if (phase != current_phase)
+    {
+        current_phase = phase;
+        pattern_start_ms = now_ms;
+    }
+
+    bool on = ((now_ms - pattern_start_ms) % period_ms) < on_ms;
+    Buzzer_SetTone(on ? freq_hz : 0U);
 }
 
 /* Debounced user button (active low). SHORT is reported on release, LONG once
