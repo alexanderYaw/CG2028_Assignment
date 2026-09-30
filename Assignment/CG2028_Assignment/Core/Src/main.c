@@ -48,6 +48,7 @@
 #define EMERGENCY_LED_DELAY_MS     50
 
 #define ALERT_REPEAT_MS          1000
+#define EVAL_REPORT_PERIOD_MS     500
 #define BUTTON_DEBOUNCE_MS         30
 #define BUTTON_LONG_PRESS_MS     2000
 
@@ -68,6 +69,7 @@ static ButtonEvent Button_Poll(uint32_t now_ms);
 static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms);
 static void Report_Status(const FallDetector *detector, const int accel_mg[3],
                           const int gyro_mdps[3], uint32_t now_ms);
+static void Report_Evaluation(const FallDetector *detector, uint32_t now_ms);
 
 extern int ewma_filter(int new_data, int old_output, int alpha_percent);
 int ewma_filter_C(int new_data, int old_output, int alpha_percent);
@@ -164,6 +166,10 @@ int main(void)
         FallEvent event = FallDetector_Update(&detector, accel_ewma_asm,
                                               gyro_ewma_asm, now_ms);
         Report_Event(event, &detector, now_ms);
+        if (event != FALL_EVENT_NONE)
+        {
+            last_report_ms = now_ms;
+        }
 
         ButtonEvent button = Button_Poll(now_ms);
         if (button == BUTTON_EVENT_SHORT)
@@ -178,8 +184,6 @@ int main(void)
         /*---------------- Outputs ----------------*/
         LED_Update(detector.phase, now_ms);
 
-        /* Nothing is printed while a possible fall is being evaluated, so the
-         * blocking UART cannot delay a sample in the critical window. */
         bool evaluating = (detector.phase == FALL_PHASE_AWAIT_IMPACT) ||
                           (detector.phase == FALL_PHASE_POST_IMPACT);
 
@@ -196,7 +200,15 @@ int main(void)
                 UART_Send(buffer);
             }
         }
-        else if (!evaluating && ((now_ms - last_report_ms) >= UART_REPORT_PERIOD_MS))
+        else if (evaluating)
+        {
+            if ((now_ms - last_report_ms) >= EVAL_REPORT_PERIOD_MS)
+            {
+                last_report_ms = now_ms;
+                Report_Evaluation(&detector, now_ms);
+            }
+        }
+        else if ((now_ms - last_report_ms) >= UART_REPORT_PERIOD_MS)
         {
             last_report_ms = now_ms;
             Report_Status(&detector, accel_ewma_asm, gyro_ewma_asm, now_ms);
@@ -382,16 +394,65 @@ static void Report_Status(const FallDetector *detector, const int accel_mg[3],
 {
     char buffer[220];
     snprintf(buffer, sizeof(buffer),
-             "[%6lu.%02lu s] %-13s |a|=%.2f g |w|=%4d dps tilt=%3d deg | "
+             "[%6lu.%02lu s] %-13s %6.1f s |a|=%.2f g |w|=%4d dps tilt=%3d deg | "
              "A[m/s^2] %6.2f %6.2f %6.2f | G[dps] %7.1f %7.1f %7.1f\r\n",
              (unsigned long)(now_ms / 1000U),
              (unsigned long)((now_ms % 1000U) / 10U),
              FallDetector_PhaseName(detector->phase),
+             (now_ms - detector->phase_start_ms) / 1000.0f,
              detector->accel_mag_mg / 1000.0f,
              detector->gyro_mag_mdps / 1000,
              detector->tilt_deg,
              accel_mg[0] * MG_TO_MPS2, accel_mg[1] * MG_TO_MPS2, accel_mg[2] * MG_TO_MPS2,
              gyro_mdps[0] / 1000.0f, gyro_mdps[1] / 1000.0f, gyro_mdps[2] / 1000.0f);
+    UART_Send(buffer);
+}
+
+static void Report_Evaluation(const FallDetector *detector, uint32_t now_ms)
+{
+    char buffer[180];
+    uint32_t in_phase_ms = now_ms - detector->phase_start_ms;
+    const char *deep = (detector->min_accel_mg < DEEP_FREE_FALL_MG) ? " (deep)" : "";
+
+    if (detector->phase == FALL_PHASE_AWAIT_IMPACT)
+    {
+        snprintf(buffer, sizeof(buffer),
+                 "[%6lu.%02lu s] %-9s %4.1f/%.1f s | waiting for impact | |a|=%.2f g | "
+                 "lowest |a| %d mg%s | rotation %d dps\r\n",
+                 (unsigned long)(now_ms / 1000U),
+                 (unsigned long)((now_ms % 1000U) / 10U),
+                 FallDetector_PhaseName(detector->phase),
+                 in_phase_ms / 1000.0f, IMPACT_WINDOW_MS / 1000.0f,
+                 detector->accel_mag_mg / 1000.0f,
+                 detector->min_accel_mg, deep,
+                 detector->peak_gyro_mdps / 1000);
+    }
+    else
+    {
+        char still[32];
+        if (in_phase_ms < POST_IMPACT_SETTLE_MS)
+        {
+            snprintf(still, sizeof(still), "settling");
+        }
+        else
+        {
+            uint32_t still_ms = (detector->post_samples > 0U)
+                              ? (now_ms - detector->inactivity_start_ms) : 0U;
+            snprintf(still, sizeof(still), "still %.2f/%.2f s",
+                     still_ms / 1000.0f, INACTIVITY_REQUIRED_MS / 1000.0f);
+        }
+        snprintf(buffer, sizeof(buffer),
+                 "[%6lu.%02lu s] %-9s %4.1f/%.0f s | %s | rotation %d dps | "
+                 "lowest |a| %d mg%s | tilt %d deg\r\n",
+                 (unsigned long)(now_ms / 1000U),
+                 (unsigned long)((now_ms % 1000U) / 10U),
+                 FallDetector_PhaseName(detector->phase),
+                 in_phase_ms / 1000.0f, POST_IMPACT_WINDOW_MS / 1000.0f,
+                 still,
+                 detector->peak_gyro_mdps / 1000,
+                 detector->min_accel_mg, deep,
+                 detector->tilt_deg);
+    }
     UART_Send(buffer);
 }
 
