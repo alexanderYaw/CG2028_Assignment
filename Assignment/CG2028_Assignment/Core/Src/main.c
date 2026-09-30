@@ -62,6 +62,7 @@ typedef enum {
 
 static void UART1_Init(void);
 static void UART_Send(const char *text);
+static void SystemClock_Config(void);
 static void Accelerometer_SetRange8g(void);
 static void LED_Update(FallPhase phase, uint32_t now_ms);
 static ButtonEvent Button_Poll(uint32_t now_ms);
@@ -77,6 +78,7 @@ UART_HandleTypeDef huart1;
 int main(void)
 {
     HAL_Init();
+    SystemClock_Config();
     UART1_Init();
 
     BSP_LED_Init(LED2);
@@ -466,6 +468,36 @@ static void UART1_Init(void)
     {
         while (1) { }
     }
+}
+
+static void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    osc.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+    osc.MSIState = RCC_MSI_ON;
+    osc.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
+    osc.MSIClockRange = RCC_MSIRANGE_6;  // 4 MHz
+    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+    osc.PLL.PLLM = 1;
+    osc.PLL.PLLN = 40;  // VCO 160 MHz
+    osc.PLL.PLLP = 2;
+    osc.PLL.PLLQ = RCC_PLLQ_DIV2;
+    osc.PLL.PLLR = RCC_PLLR_DIV2;  // SYSCLK 80 MHz
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) { while (1) { } }
+
+    clk.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
+                    RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK) { while (1) { } }
 }
 
 /* Do not modify these lines. They suppress UART-related warnings. */
