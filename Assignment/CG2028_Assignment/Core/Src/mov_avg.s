@@ -34,11 +34,12 @@
 @ - Do not call a C helper function and do not use floating-point instructions.
 @
 @ Register table:
-@   R0 ...
-@   R1 ...
-@   R2 ...
-@   R3 ...
-@   R4 ...
+@   R0  in: new_data; then alpha_percent * new_data; then the full
+@       numerator; out: numerator / 100 (the filtered output)
+@   R1  in: old_output (read only)
+@   R2  in: alpha_percent (read only)
+@   R3  scratch: 100 - alpha_percent, then the divisor 100
+@   R4-R7 not used (saved and restored by the template's PUSH/POP)
 @
 @ Write your program from here.
 ewma_filter:
@@ -48,7 +49,7 @@ ewma_filter:
 
     RSB r3, r2, #100  @ 100 - alpha_percent
 
-    MLA r0, r3, r1, r0  @ (alpha_current x new_data) + (100 - alpha_percent) x old_output
+    MLA r0, r3, r1, r0  @ (alpha_percent x new_data) + (100 - alpha_percent) x old_output
 
     MOV r3, #100
     SDIV r0, r0, r3
