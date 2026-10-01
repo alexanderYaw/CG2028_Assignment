@@ -15,7 +15,7 @@
 @ CG2028 Assignment
 @ (c) ECE NUS
 @ Write Student 1's Name here: Alexander Yaw Kai Mun (A0306763B)
-@ Write Student 2's Name here: WXYZ (A0000007X)
+@ Write Student 2's Name here: Yeo Yee Ching (A0306767U)
 @
 @ Function prototype:
 @   int ewma_filter(int new_data, int old_output, int alpha_percent);
@@ -34,12 +34,13 @@
 @ - Do not call a C helper function and do not use floating-point instructions.
 @
 @ Register table:
-@   R0  in: new_data; then alpha_percent * new_data; then the full
-@       numerator; out: numerator / 100 (the filtered output)
-@   R1  in: old_output (read only)
-@   R2  in: alpha_percent (read only)
-@   R3  scratch: 100 - alpha_percent, then the divisor 100
-@   R4-R7 not used (saved and restored by the template's PUSH/POP)
+@   R0 = new_data on entry; alpha_percent x new_data; then the numerator;
+@        finally the returned filtered output
+@   R1 = old_output (unchanged)
+@   R2 = alpha_percent (unchanged)
+@   R3 = scratch: (100 - alpha_percent), then the divisor 100
+@   R4-R7 = not used; pushed and popped so the routine stays safe if it is
+@        later extended to use them
 @
 @ Write your program from here.
 ewma_filter:
