@@ -32,7 +32,7 @@ Confirmation in POST_IMPACT needs all three, each a different quantity:
 | Check | Threshold | Rejects |
 |---|---|---|
 | Rapid rotation (gyro) | peak ≥ 150 dps, incl. the second before the trigger | sitting, bending (< ~100 dps) |
-| Posture change (accel direction) | ≥ 65° vs last stationary posture (ignored after ≥ 1 s of shaking), or a deep drop < 300 mg | shaking, hopping, placing the board down |
+| Posture change (accel direction) | ≥ 65° vs last stationary posture (ignored after ≥ 1 s of shaking), or a deep drop < 255 mg | shaking, hopping, placing the board down |
 | Inactivity | stationary ≥ 750 ms continuously | carrying, walking on after a stumble |
 
 ## Parameter justification

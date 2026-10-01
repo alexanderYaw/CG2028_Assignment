@@ -40,7 +40,7 @@
 #define FREE_FALL_MIN_SAMPLES        3  // 60 ms, rejects single noisy sample
 #define IMPACT_MG                 1800  // hard landing, no free fall needed
 #define SOFT_IMPACT_MG            1300  // enough after a confirmed free fall
-#define DEEP_FREE_FALL_MG          300  // drops 18-237 mg, activities >= 434
+#define DEEP_FREE_FALL_MG          255  // falls dip <= ~235 mg; caught stumble ~270+
 #define LANDING_MG                 950  // back to ~1 g after a deep free fall
 #define SUDDEN_CHANGE_MG           600  // jerk trigger for falls w/o free fall
 #define RAPID_ROTATION_MDPS     150000  // 150 dps; sitting/bending < ~100
