@@ -9,8 +9,7 @@
  *   LSM6DSL accel [mg] + gyro [mdps]
  *        -> ewma_filter (ARM assembly, one recursive state per axis, 6 axes)
  *        -> FallDetector_Update (fall_detector.c): features, phase machine
- *        -> outputs: LED2 blink pattern, buzzer, OLED, UART status/event log
- *           (or a CSV line per sample when DATA_LOG_MODE is 1)
+ *        -> outputs: LED2 blink pattern, buzzer, OLED, UART status and event log
  *
  * User button (blue, PC13):
  *   short press during an alarm -> "I am OK" (acknowledge)
@@ -32,7 +31,6 @@
 /*--------------------------- Includes ---------------------------------------*/
 #include "main.h"
 #include "fall_detector.h"
-#include "data_logger.h"
 #include "oled_display.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
@@ -85,15 +83,6 @@ typedef enum {
 	BUTTON_EVENT_LONG
 } ButtonEvent;
 
-/* One sample from both sensors, before and after the assembly EWMA. */
-typedef struct {
-	int  accel_raw_mg[3];
-	int  gyro_raw_mdps[3];
-	int  accel_mg[3];  // filtered: the only data detection uses
-	int  gyro_mdps[3];  // filtered: the only data detection uses
-	bool asm_matches_c;  // all 6 axes agree with ewma_filter_C
-} SensorSample;
-
 /*--------------------------- Prototypes -------------------------------------*/
 /* Implemented in mov_avg.s */
 extern int ewma_filter(int new_data, int old_output, int alpha_percent);
@@ -104,7 +93,7 @@ static void Accelerometer_SetRange8g(void);
 static void Buzzer_Init(void);
 
 static uint32_t Wait_For_Next_Sample(uint32_t *next_sample_ms);
-static void Sensors_ReadFiltered(SensorSample *sample);
+static bool Sensors_ReadFiltered(int accel_mg[3], int gyro_mdps[3]);
 static int ewma_filter_C(int new_data, int old_output, int alpha_percent);
 
 static void LED_Update(FallPhase phase, uint32_t now_ms);
@@ -112,10 +101,7 @@ static void Buzzer_SetTone(uint32_t freq_hz);
 static void Buzzer_Update(FallPhase phase, uint32_t now_ms);
 static ButtonEvent Button_Poll(uint32_t now_ms);
 
-static void Report_Startup(bool oled_present);
 static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms);
-static void Log_Sample(const SensorSample *sample, FallPhase phase, FallEvent event,
-                       uint32_t now_ms);
 static void Report_Periodic(const FallDetector *detector, const int accel_mg[3],
                             const int gyro_mdps[3], bool event_reported,
                             bool *asm_mismatch, uint32_t now_ms);
@@ -155,7 +141,11 @@ int main(void)
     FallDetector detector;
     FallDetector_Init(&detector, HAL_GetTick());
 
-    Report_Startup(oled_present);
+    UART_Send("\r\n=== ElderCare Wearable Safety Companion ===\r\n"
+              "Hold the board still and upright to set the reference posture.\r\n"
+              "Button: short press = I am OK, hold 2 s = SOS.\r\n");
+    UART_Send(oled_present ? "OLED display detected on I2C1.\r\n"
+                           : "No OLED on I2C1 - continuing without display.\r\n");
 
     uint32_t next_sample_ms = HAL_GetTick();
     bool asm_mismatch = false;
@@ -164,44 +154,32 @@ int main(void)
     {
         uint32_t now_ms = Wait_For_Next_Sample(&next_sample_ms);
 
-        SensorSample sample;
-        Sensors_ReadFiltered(&sample);
-        if (!sample.asm_matches_c)
+        /* Detection only ever sees the assembly-filtered data. */
+        int accel_mg[3];
+        int gyro_mdps[3];
+        if (Sensors_ReadFiltered(accel_mg, gyro_mdps))
         {
             asm_mismatch = true;
         }
 
-        FallEvent event = FallDetector_Update(&detector, sample.accel_mg,
-                                              sample.gyro_mdps, now_ms);
+        FallEvent event = FallDetector_Update(&detector, accel_mg, gyro_mdps, now_ms);
         Report_Event(event, &detector, now_ms);
 
         ButtonEvent button = Button_Poll(now_ms);
-        FallEvent button_event = FALL_EVENT_NONE;
         if (button == BUTTON_EVENT_SHORT)
         {
-            button_event = FallDetector_Acknowledge(&detector, now_ms);
+            Report_Event(FallDetector_Acknowledge(&detector, now_ms), &detector, now_ms);
         }
         else if (button == BUTTON_EVENT_LONG)
         {
-            button_event = FallDetector_RequestSOS(&detector, now_ms);
+            Report_Event(FallDetector_RequestSOS(&detector, now_ms), &detector, now_ms);
         }
-        Report_Event(button_event, &detector, now_ms);
 
         LED_Update(detector.phase, now_ms);
         Buzzer_Update(detector.phase, now_ms);
         OLED_Update(&detector, now_ms);
-
-        if (DATA_LOG_MODE)
-        {
-            /* CSV only: text reports would corrupt the log. */
-            Log_Sample(&sample, detector.phase,
-                       (button_event != FALL_EVENT_NONE) ? button_event : event, now_ms);
-        }
-        else
-        {
-            Report_Periodic(&detector, sample.accel_mg, sample.gyro_mdps,
-                            event != FALL_EVENT_NONE, &asm_mismatch, now_ms);
-        }
+        Report_Periodic(&detector, accel_mg, gyro_mdps,
+                        event != FALL_EVENT_NONE, &asm_mismatch, now_ms);
     }
 }
 
@@ -225,8 +203,8 @@ static uint32_t Wait_For_Next_Sample(uint32_t *next_sample_ms)
 
 /* Reads both sensors and passes every axis through the assembly EWMA filter.
  * The C reference filter runs alongside on its own state purely to verify the
- * assembly; asm_matches_c is false if the two disagree on any axis. */
-static void Sensors_ReadFiltered(SensorSample *sample)
+ * assembly; returns true if the two disagree on any axis. */
+static bool Sensors_ReadFiltered(int accel_mg[3], int gyro_mdps[3])
 {
     /* Previous EWMA outputs: one independent recursive state per axis. */
     static int accel_ewma[3];
@@ -239,7 +217,7 @@ static void Sensors_ReadFiltered(SensorSample *sample)
     BSP_ACCELERO_AccGetXYZ(accel_raw);  // mg
     BSP_GYRO_GetXYZ(gyro_raw);  // mdps
 
-    sample->asm_matches_c = true;
+    bool mismatch = false;
     for (int axis = 0; axis < 3; axis++)
     {
         int accel_in = accel_raw[axis];
@@ -254,14 +232,13 @@ static void Sensors_ReadFiltered(SensorSample *sample)
         if ((accel_ewma[axis] != accel_ewma_c[axis]) ||
             (gyro_ewma[axis] != gyro_ewma_c[axis]))
         {
-            sample->asm_matches_c = false;
+            mismatch = true;
         }
 
-        sample->accel_raw_mg[axis] = accel_in;
-        sample->gyro_raw_mdps[axis] = gyro_in;
-        sample->accel_mg[axis] = accel_ewma[axis];
-        sample->gyro_mdps[axis] = gyro_ewma[axis];
+        accel_mg[axis] = accel_ewma[axis];
+        gyro_mdps[axis] = gyro_ewma[axis];
     }
+    return mismatch;
 }
 
 /* Reference implementation for verification only. The assembly routine must
@@ -480,34 +457,9 @@ static ButtonEvent Button_Poll(uint32_t now_ms)
 
 /*--------------------------- UART reporting ---------------------------------*/
 
-/* In data-logging mode only the CSV header is sent, so the stream stays
- * machine-readable. */
-static void Report_Startup(bool oled_present)
-{
-    if (DATA_LOG_MODE)
-    {
-        char header[256];
-        DataLogger_FormatHeader(header, sizeof(header), EWMA_ALPHA_ACCEL_PERCENT,
-                                EWMA_ALPHA_GYRO_PERCENT, SAMPLE_PERIOD_MS);
-        UART_Send(header);
-        return;
-    }
-
-    UART_Send("\r\n=== ElderCare Wearable Safety Companion ===\r\n"
-              "Hold the board still and upright to set the reference posture.\r\n"
-              "Button: short press = I am OK, hold 2 s = SOS.\r\n");
-    UART_Send(oled_present ? "OLED display detected on I2C1.\r\n"
-                           : "No OLED on I2C1 - continuing without display.\r\n");
-}
-
 /* One line per detector event. */
 static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t now_ms)
 {
-    if (DATA_LOG_MODE)
-    {
-        return;  // events are logged as a CSV column instead
-    }
-
     switch (event)
     {
     case FALL_EVENT_READY:
@@ -554,29 +506,6 @@ static void Report_Event(FallEvent event, const FallDetector *detector, uint32_t
     default:
         break;
     }
-}
-
-/* One CSV line per sample for Part2_Simulation/replay.c (DATA_LOG_MODE). */
-static void Log_Sample(const SensorSample *sample, FallPhase phase, FallEvent event,
-                       uint32_t now_ms)
-{
-    DataLogSample log = {
-        .t_ms = now_ms,
-        .phase = phase,
-        .event = event,
-        .asm_matches_c = sample->asm_matches_c,
-    };
-    for (int axis = 0; axis < 3; axis++)
-    {
-        log.accel_raw_mg[axis] = sample->accel_raw_mg[axis];
-        log.gyro_raw_mdps[axis] = sample->gyro_raw_mdps[axis];
-        log.accel_filt_mg[axis] = sample->accel_mg[axis];
-        log.gyro_filt_mdps[axis] = sample->gyro_mdps[axis];
-    }
-
-    char line[160];
-    DataLogger_FormatSample(line, sizeof(line), &log);
-    UART_Send(line);
 }
 
 /* Periodic line, chosen by phase: recovery progress during an alarm, a

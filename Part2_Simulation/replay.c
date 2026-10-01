@@ -1,9 +1,10 @@
 /* Replay recorded trials through the real detector, on a PC.
  *
- * capture.py records the raw sensor columns from the board. This tool feeds
- * those raw values through the EWMA and fall_detector.c that the firmware
- * uses, so a threshold change can be judged against every trial in seconds
- * instead of re-staging each fall by hand.
+ * recordings/ holds raw sensor columns captured from the board with an
+ * earlier CSV-logging build. This tool feeds those raw values through the
+ * EWMA and fall_detector.c that the firmware uses, so a threshold change can
+ * be judged against every trial in seconds instead of re-staging each fall
+ * by hand.
  *
  * Build and run from the repository root:
  *   gcc -O2 -IAssignment/CG2028_Assignment/Core/Inc Part2_Simulation/replay.c \
@@ -12,7 +13,7 @@
  *   ./replay -v Part2_Simulation/recordings/hard_fall_1.csv   event by event
  *
  * A trial counts as expecting a fall when its name contains "fall", which is
- * how capture.py names them. Everything else must stay quiet.
+ * how the recordings are named. Everything else must stay quiet.
  */
 
 #include <stdio.h>
