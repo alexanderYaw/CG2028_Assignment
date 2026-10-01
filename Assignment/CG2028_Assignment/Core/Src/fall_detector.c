@@ -126,7 +126,7 @@ static int recent_peak_gyro(const FallDetector *detector)
 {
 	int peak = 0;
 
-	for (uint32_t i = 0; i < GYRO_HISTORY_LEN; i++) {
+	for (uint32_t i = 0; i < HISTORY_LEN; i++) {
 		if (detector->gyro_history[i] > peak) {
 			peak = detector->gyro_history[i];
 		}
@@ -138,7 +138,7 @@ static int recent_min_accel(const FallDetector *detector)
 {
 	int lowest = detector->accel_history[0];
 
-	for (uint32_t i = 1; i < GYRO_HISTORY_LEN; i++) {
+	for (uint32_t i = 1; i < HISTORY_LEN; i++) {
 		if (detector->accel_history[i] < lowest) {
 			lowest = detector->accel_history[i];
 		}
@@ -154,6 +154,13 @@ static uint32_t current_osc_ms(const FallDetector *detector, uint32_t now_ms)
 	return detector->last_reversal_ms - detector->osc_chain_start_ms;
 }
 
+/* Discard the posture samples collected so far after an impact. */
+static void reset_post_window(FallDetector *detector)
+{
+	detector->post_sum[0] = detector->post_sum[1] = detector->post_sum[2] = 0;
+	detector->post_samples = 0;
+}
+
 static void start_suspected_fall(FallDetector *detector, uint32_t now_ms)
 {
 	detector->free_fall_samples = 0;
@@ -161,8 +168,7 @@ static void start_suspected_fall(FallDetector *detector, uint32_t now_ms)
 	detector->peak_gyro_mdps = recent_peak_gyro(detector);
 	detector->min_accel_mg = recent_min_accel(detector);
 	detector->max_osc_ms = current_osc_ms(detector, now_ms);
-	detector->post_sum[0] = detector->post_sum[1] = detector->post_sum[2] = 0;
-	detector->post_samples = 0;
+	reset_post_window(detector);
 	detector->is_inactive = false;
 	detector->inactivity_start_ms = now_ms;
 	detector->last_reason[0] = '\0';
@@ -179,16 +185,17 @@ static void back_to_monitoring(FallDetector *detector, uint32_t now_ms,
 	enter_phase(detector, FALL_PHASE_MONITORING, now_ms);
 }
 
-static void append_reason(char *buffer, const char *text)
+/* Adds text to last_reason as a comma-separated list, truncating if full. */
+static void append_reason(FallDetector *detector, const char *text)
 {
-	size_t used = strlen(buffer);
-	size_t room = sizeof(((FallDetector *)0)->last_reason) - used - 1U;
+	size_t used = strlen(detector->last_reason);
+	size_t room = sizeof(detector->last_reason) - used - 1U;
 
 	if (used > 0 && room > 2) {
-		strncat(buffer, ", ", room);
+		strncat(detector->last_reason, ", ", room);
 		room -= 2;
 	}
-	strncat(buffer, text, room);
+	strncat(detector->last_reason, text, room);
 }
 
 /* Decide between a real fall and a near-fall at the end of the observation
@@ -225,13 +232,13 @@ static FallEvent evaluate_suspected_fall(FallDetector *detector, uint32_t now_ms
 
 	detector->last_reason[0] = '\0';
 	if (!rotation_ok) {
-		append_reason(detector->last_reason, "rotation too slow");
+		append_reason(detector, "rotation too slow");
 	}
 	if (!posture_ok && !dropped) {
-		append_reason(detector->last_reason, oscillated ? "shaken, no drop" : "no posture change or drop");
+		append_reason(detector, oscillated ? "shaken, no drop" : "no posture change or drop");
 	}
 	if (!inactivity_ok) {
-		append_reason(detector->last_reason, "still moving after impact");
+		append_reason(detector, "still moving after impact");
 	}
 	back_to_monitoring(detector, now_ms, 0);
 	return FALL_EVENT_NEAR_FALL;
@@ -257,9 +264,9 @@ static void update_features(FallDetector *detector, const int accel_mg[3],
 	                   ? angle_between_deg(accel_mg, detector->pre_fall_accel)
 	                   : 0;
 
-	detector->gyro_history[detector->gyro_history_idx] = detector->gyro_mag_mdps;
-	detector->accel_history[detector->gyro_history_idx] = detector->accel_mag_mg;
-	detector->gyro_history_idx = (detector->gyro_history_idx + 1U) % GYRO_HISTORY_LEN;
+	detector->gyro_history[detector->history_idx] = detector->gyro_mag_mdps;
+	detector->accel_history[detector->history_idx] = detector->accel_mag_mg;
+	detector->history_idx = (detector->history_idx + 1U) % HISTORY_LEN;
 
 	if (detector->gyro_mag_mdps > detector->peak_gyro_mdps) {
 		detector->peak_gyro_mdps = detector->gyro_mag_mdps;
@@ -294,6 +301,160 @@ static void update_features(FallDetector *detector, const int accel_mg[3],
 	}
 }
 
+/*--------------------------- Phase handlers ---------------------------------*/
+
+/* The most recent stationary posture is the reference that a fall is measured
+ * against, so it follows slow, deliberate posture changes. Returns READY the
+ * first time a reference is set. */
+static FallEvent update_reference_posture(FallDetector *detector,
+                                          const int accel_mg[3], uint32_t now_ms)
+{
+	if (!detector->is_stationary) {
+		detector->reference_still_start_ms = now_ms;
+		return FALL_EVENT_NONE;
+	}
+	if ((now_ms - detector->reference_still_start_ms) < REFERENCE_HOLD_MS) {
+		return FALL_EVENT_NONE;
+	}
+
+	for (int i = 0; i < 3; i++) {
+		detector->pre_fall_accel[i] = accel_mg[i];
+	}
+	if (!detector->has_pre_fall_accel) {
+		detector->has_pre_fall_accel = true;
+		return FALL_EVENT_READY;
+	}
+	return FALL_EVENT_NONE;
+}
+
+/* MONITORING: look for any of the three ways a fall can start. */
+static FallEvent update_monitoring(FallDetector *detector, const int accel_mg[3],
+                                   uint32_t now_ms)
+{
+	FallEvent event = update_reference_posture(detector, accel_mg, now_ms);
+	bool warmed_up = (now_ms - detector->startup_timer_ms) >= STARTUP_WARMUP_MS;
+	bool rearmed = (int32_t)(now_ms - detector->rearm_until_ms) >= 0;
+
+	if (!warmed_up || !rearmed) {
+		detector->free_fall_samples = 0;
+		return event;
+	}
+
+	detector->free_fall_samples = detector->is_free_fall
+	                            ? detector->free_fall_samples + 1U : 0U;
+
+	if (detector->free_fall_samples >= FREE_FALL_MIN_SAMPLES) {
+		start_suspected_fall(detector, now_ms);
+		detector->free_fall_seen = true;
+		enter_phase(detector, FALL_PHASE_AWAIT_IMPACT, now_ms);
+		event = FALL_EVENT_FREE_FALL;
+	} else if (detector->accel_mag_mg >= IMPACT_MG) {
+		/* Hard impact with no preceding free fall, e.g. a trip. */
+		start_suspected_fall(detector, now_ms);
+		detector->free_fall_seen = false;
+		detector->impact_ms = now_ms;
+		enter_phase(detector, FALL_PHASE_POST_IMPACT, now_ms);
+		event = FALL_EVENT_IMPACT;
+	} else if (detector->has_prev_accel && detector->is_rapid_rotation &&
+	           is_vector_change_exceeded(accel_mg, detector->prev_accel,
+	                                     SUDDEN_CHANGE_MG)) {
+		/* Sudden jerk together with fast rotation: a collapse can look
+		 * like this without ever reaching free fall. */
+		start_suspected_fall(detector, now_ms);
+		detector->free_fall_seen = false;
+		enter_phase(detector, FALL_PHASE_AWAIT_IMPACT, now_ms);
+		event = FALL_EVENT_FREE_FALL;
+	}
+	return event;
+}
+
+/* AWAIT_IMPACT: the body is falling; wait up to IMPACT_WINDOW_MS for it to
+ * land. */
+static FallEvent update_await_impact(FallDetector *detector, uint32_t in_phase_ms,
+                                     uint32_t now_ms)
+{
+	/* After a confirmed free fall even a soft landing counts, because the
+	 * loss of support has already been established. */
+	int impact_threshold = detector->free_fall_seen ? SOFT_IMPACT_MG : IMPACT_MG;
+
+	if (detector->min_accel_mg < DEEP_FREE_FALL_MG) {
+		impact_threshold = LANDING_MG;
+	}
+
+	if (detector->accel_mag_mg >= impact_threshold) {
+		detector->impact_ms = now_ms;
+		enter_phase(detector, FALL_PHASE_POST_IMPACT, now_ms);
+		return FALL_EVENT_IMPACT;
+	}
+	if (in_phase_ms >= IMPACT_WINDOW_MS) {
+		strcpy(detector->last_reason, "no impact after trigger");
+		detector->last_rotation_mdps = detector->peak_gyro_mdps;
+		detector->last_posture_deg = detector->tilt_deg;
+		detector->last_inactive_pct = 0;
+		back_to_monitoring(detector, now_ms, 0);
+		return FALL_EVENT_NEAR_FALL;
+	}
+	return FALL_EVENT_NONE;
+}
+
+/* POST_IMPACT: after the settle time, wait for continuous stillness and then
+ * decide. Gives up and decides anyway at the end of the window. */
+static FallEvent update_post_impact(FallDetector *detector, const int accel_mg[3],
+                                    uint32_t in_phase_ms, uint32_t now_ms)
+{
+	if (in_phase_ms >= POST_IMPACT_SETTLE_MS) {
+		if (detector->is_stationary) {
+			if (detector->post_samples == 0) {
+				detector->inactivity_start_ms = now_ms;
+			}
+			for (int i = 0; i < 3; i++) {
+				detector->post_sum[i] += accel_mg[i];
+			}
+			detector->post_samples++;
+
+			if ((now_ms - detector->inactivity_start_ms) >= INACTIVITY_REQUIRED_MS) {
+				detector->is_inactive = true;
+				return evaluate_suspected_fall(detector, now_ms);
+			}
+		} else {
+			reset_post_window(detector);
+		}
+	}
+	if (in_phase_ms >= POST_IMPACT_WINDOW_MS) {
+		return evaluate_suspected_fall(detector, now_ms);
+	}
+	return FALL_EVENT_NONE;
+}
+
+/* ALARM: escalate after LONG_LIE_MS, or clear once the wearer has got up
+ * (moved away from the floor posture, then back near the reference and
+ * steady for RECOVERY_HOLD_MS). */
+static FallEvent update_alarm(FallDetector *detector, uint32_t now_ms)
+{
+	if ((now_ms - detector->alarm_ms) >= LONG_LIE_MS) {
+		enter_phase(detector, FALL_PHASE_LONG_LIE, now_ms);
+		return FALL_EVENT_LONG_LIE;
+	}
+
+	if (detector->tilt_deg >= RECOVERY_LEAVE_DEG) {
+		detector->moved_since_alarm = true;
+	}
+	if (!detector->moved_since_alarm ||
+	    detector->tilt_deg >= RECOVERY_TILT_DEG || !detector->is_stationary) {
+		detector->is_recovering = false;
+		return FALL_EVENT_NONE;
+	}
+
+	if (!detector->is_recovering) {
+		detector->is_recovering = true;
+		detector->recovery_start_ms = now_ms;
+	} else if ((now_ms - detector->recovery_start_ms) >= RECOVERY_HOLD_MS) {
+		back_to_monitoring(detector, now_ms, REARM_DELAY_MS);
+		return FALL_EVENT_RECOVERED;
+	}
+	return FALL_EVENT_NONE;
+}
+
 /*------------------------------- API ----------------------------------------*/
 
 void FallDetector_Init(FallDetector *detector, uint32_t now_ms)
@@ -305,7 +466,7 @@ void FallDetector_Init(FallDetector *detector, uint32_t now_ms)
 	detector->reference_still_start_ms = now_ms;
 	detector->last_reversal_ms = now_ms - OSCILLATION_GAP_MS - 1U;
 
-	for (uint32_t i = 0; i < GYRO_HISTORY_LEN; i++) {
+	for (uint32_t i = 0; i < HISTORY_LEN; i++) {
 		detector->accel_history[i] = 1000;
 	}
 }
@@ -315,133 +476,22 @@ FallEvent FallDetector_Update(FallDetector *detector, const int accel_mg[3],
 {
 	update_features(detector, accel_mg, gyro_mdps, now_ms);
 
-	bool warmed_up = (now_ms - detector->startup_timer_ms) >= STARTUP_WARMUP_MS;
 	uint32_t in_phase_ms = now_ms - detector->phase_start_ms;
 	FallEvent event = FALL_EVENT_NONE;
 
 	switch (detector->phase) {
 	case FALL_PHASE_MONITORING:
-		/* The most recent stationary posture is the reference that a fall is
-		 * measured against, so it follows slow, deliberate posture changes. */
-		if (!detector->is_stationary) {
-			detector->reference_still_start_ms = now_ms;
-		} else if ((now_ms - detector->reference_still_start_ms) >= REFERENCE_HOLD_MS) {
-			for (int i = 0; i < 3; i++) {
-				detector->pre_fall_accel[i] = accel_mg[i];
-			}
-			if (!detector->has_pre_fall_accel) {
-				detector->has_pre_fall_accel = true;
-				event = FALL_EVENT_READY;
-			}
-		}
-
-		if (!warmed_up || (int32_t)(now_ms - detector->rearm_until_ms) < 0) {
-			detector->free_fall_samples = 0;
-			break;
-		}
-
-		detector->free_fall_samples = detector->is_free_fall
-		                            ? detector->free_fall_samples + 1U : 0U;
-
-		if (detector->free_fall_samples >= FREE_FALL_MIN_SAMPLES) {
-			start_suspected_fall(detector, now_ms);
-			detector->free_fall_seen = true;
-			enter_phase(detector, FALL_PHASE_AWAIT_IMPACT, now_ms);
-			event = FALL_EVENT_FREE_FALL;
-		} else if (detector->accel_mag_mg >= IMPACT_MG) {
-			/* Hard impact with no preceding free fall, e.g. a trip. */
-			start_suspected_fall(detector, now_ms);
-			detector->free_fall_seen = false;
-			detector->impact_ms = now_ms;
-			enter_phase(detector, FALL_PHASE_POST_IMPACT, now_ms);
-			event = FALL_EVENT_IMPACT;
-		} else if (detector->has_prev_accel && detector->is_rapid_rotation &&
-		           is_vector_change_exceeded(accel_mg, detector->prev_accel,
-		                                     SUDDEN_CHANGE_MG)) {
-			/* Sudden jerk together with fast rotation: a collapse can look
-			 * like this without ever reaching free fall. */
-			start_suspected_fall(detector, now_ms);
-			detector->free_fall_seen = false;
-			enter_phase(detector, FALL_PHASE_AWAIT_IMPACT, now_ms);
-			event = FALL_EVENT_FREE_FALL;
-		}
+		event = update_monitoring(detector, accel_mg, now_ms);
 		break;
-
 	case FALL_PHASE_AWAIT_IMPACT:
-	{
-		/* After a confirmed free fall even a soft landing counts, because the
-		 * loss of support has already been established. */
-		int impact_threshold = detector->free_fall_seen ? SOFT_IMPACT_MG : IMPACT_MG;
-
-		if (detector->min_accel_mg < DEEP_FREE_FALL_MG) {
-			impact_threshold = LANDING_MG;
-		}
-
-		if (detector->accel_mag_mg >= impact_threshold) {
-			detector->impact_ms = now_ms;
-			enter_phase(detector, FALL_PHASE_POST_IMPACT, now_ms);
-			event = FALL_EVENT_IMPACT;
-		} else if (in_phase_ms >= IMPACT_WINDOW_MS) {
-			strcpy(detector->last_reason, "no impact after trigger");
-			detector->last_rotation_mdps = detector->peak_gyro_mdps;
-			detector->last_posture_deg = detector->tilt_deg;
-			detector->last_inactive_pct = 0;
-			back_to_monitoring(detector, now_ms, 0);
-			event = FALL_EVENT_NEAR_FALL;
-		}
+		event = update_await_impact(detector, in_phase_ms, now_ms);
 		break;
-	}
-
 	case FALL_PHASE_POST_IMPACT:
-		if (in_phase_ms >= POST_IMPACT_SETTLE_MS) {
-			if (detector->is_stationary) {
-				if (detector->post_samples == 0) {
-					detector->inactivity_start_ms = now_ms;
-				}
-				for (int i = 0; i < 3; i++) {
-					detector->post_sum[i] += accel_mg[i];
-				}
-				detector->post_samples++;
-
-				if ((now_ms - detector->inactivity_start_ms) >= INACTIVITY_REQUIRED_MS) {
-					detector->is_inactive = true;
-					event = evaluate_suspected_fall(detector, now_ms);
-					break;
-				}
-			} else {
-				detector->post_sum[0] = detector->post_sum[1] = detector->post_sum[2] = 0;
-				detector->post_samples = 0;
-			}
-		}
-		if (in_phase_ms >= POST_IMPACT_WINDOW_MS) {
-			event = evaluate_suspected_fall(detector, now_ms);
-		}
+		event = update_post_impact(detector, accel_mg, in_phase_ms, now_ms);
 		break;
-
 	case FALL_PHASE_ALARM:
-		if ((now_ms - detector->alarm_ms) >= LONG_LIE_MS) {
-			enter_phase(detector, FALL_PHASE_LONG_LIE, now_ms);
-			event = FALL_EVENT_LONG_LIE;
-			break;
-		}
-		/* Self-recovery: back near the pre-fall posture and steady. */
-		if (detector->tilt_deg >= RECOVERY_LEAVE_DEG) {
-			detector->moved_since_alarm = true;
-		}
-		if (detector->moved_since_alarm &&
-		    detector->tilt_deg < RECOVERY_TILT_DEG && detector->is_stationary) {
-			if (!detector->is_recovering) {
-				detector->is_recovering = true;
-				detector->recovery_start_ms = now_ms;
-			} else if ((now_ms - detector->recovery_start_ms) >= RECOVERY_HOLD_MS) {
-				back_to_monitoring(detector, now_ms, REARM_DELAY_MS);
-				event = FALL_EVENT_RECOVERED;
-			}
-		} else {
-			detector->is_recovering = false;
-		}
+		event = update_alarm(detector, now_ms);
 		break;
-
 	case FALL_PHASE_LONG_LIE:
 	case FALL_PHASE_SOS:
 	default:

@@ -28,11 +28,11 @@ typedef struct {
 	uint32_t  t_ms;
 	int       accel_raw_mg[3];
 	int       gyro_raw_mdps[3];
-	int       accel_filt_mg[3];      /* assembly EWMA output */
-	int       gyro_filt_mdps[3];     /* assembly EWMA output */
+	int       accel_filt_mg[3];  // assembly EWMA output
+	int       gyro_filt_mdps[3];  // assembly EWMA output
 	FallPhase phase;
 	FallEvent event;
-	bool      asm_matches_c;         /* all 6 axes agree with ewma_filter_C */
+	bool      asm_matches_c;  // all 6 axes agree with ewma_filter_C
 } DataLogSample;
 
 /* '#' comment lines describing the configuration, then the CSV column names.
@@ -43,4 +43,4 @@ int DataLogger_FormatHeader(char *buffer, size_t size, int alpha_accel_percent,
 /* One CSV line, terminated by \r\n. */
 int DataLogger_FormatSample(char *buffer, size_t size, const DataLogSample *sample);
 
-#endif /* DATA_LOGGER_H */
+#endif  // DATA_LOGGER_H

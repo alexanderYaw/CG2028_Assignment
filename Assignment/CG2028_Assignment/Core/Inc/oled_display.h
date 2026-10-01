@@ -40,7 +40,7 @@
 
 /* How often a changed row may be pushed to the panel. */
 #define OLED_FLUSH_INTERVAL_MS  60
-#define OLED_EVAL_FLUSH_MS     200   /* slower while a fall is being judged */
+#define OLED_EVAL_FLUSH_MS     200  // slower while a fall is being judged
 
 /* Returns false if the panel does not acknowledge, e.g. it is not wired up.
  * The rest of the system runs normally either way. */
@@ -54,4 +54,4 @@ void OLED_Update(const FallDetector *detector, uint32_t now_ms);
  * Zero in any other phase. */
 uint32_t OLED_SecondsUntilLongLie(const FallDetector *detector, uint32_t now_ms);
 
-#endif /* OLED_DISPLAY_H */
+#endif  // OLED_DISPLAY_H

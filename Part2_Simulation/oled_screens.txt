@@ -160,13 +160,13 @@ FALL ALARM, COUNTING DOWN
     |#   # #   # #     #       #   #   # #   #       #   # #     #     #             #   #   #                                     |
     | ###  #   # ##### #####  ###  #   #  ###        #   # ##### ##### #            ###  #   #                                     |
     |                                                                                                                              |
-    |                                      #    ###         ####                                                                   |
-    |                                     ##   #   #       #                                                                       |
-    |                                      #       #       #                                                                       |
-    |                                      #      #         ###                                                                    |
+    |                                     ###  #####        ####                                                                   |
+    |                                    #   #     #       #                                                                       |
+    |                                        #    #        #                                                                       |
+    |                                       #    #          ###                                                                    |
     |                                      #     #             #                                                                   |
-    |                                      #    #              #                                                                   |
-    |                                     ###  #####       ####                                                                    |
+    |                                     #      #             #                                                                   |
+    |                                    #####   #         ####                                                                    |
     |                                                                                                                              |
     |                                                                                                                              |
     |                                                                                                                              |
@@ -406,12 +406,12 @@ MANUAL SOS
     |                                                                                                                              |
     +------------------------------------------------------------------------------------------------------------------------------+
 
-countdown check (LONG_LIE_MS = 15000):
-       0 ms after alarm -> 15 s
-       1 ms after alarm -> 15 s
-     999 ms after alarm -> 15 s
-    1000 ms after alarm -> 14 s
-   14000 ms after alarm ->  1 s
-   14999 ms after alarm ->  1 s
-   15000 ms after alarm ->  0 s
+countdown check (LONG_LIE_MS = 30000):
+       0 ms after alarm -> 30 s
+       1 ms after alarm -> 30 s
+     999 ms after alarm -> 30 s
+    1000 ms after alarm -> 29 s
+   29000 ms after alarm ->  1 s
+   29999 ms after alarm ->  1 s
+   30000 ms after alarm ->  0 s
   while monitoring        ->  0 s (expected 0)

@@ -50,7 +50,7 @@ ewma_filter:
 
     RSB r3, r2, #100  @ 100 - alpha_percent
 
-    MLA r0, r3, r1, r0  @ (alpha_current x new_data) + (100 - alpha_percent) x old_output
+    MLA r0, r3, r1, r0  @ (alpha_percent x new_data) + (100 - alpha_percent) x old_output
 
     MOV r3, #100
     SDIV r0, r0, r3
